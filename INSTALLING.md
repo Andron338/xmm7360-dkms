@@ -42,6 +42,34 @@ echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
 echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf
 echo "nameserver 9.9.9.9" | sudo tee -a /etc/resolv.conf
 ```
+## Arch Linux 7.0
+
+```
+mkdir ~/tmp/
+cd ~/tmp/
+sudo pacman -S python-pyroute python-configargparse git
+git clone https://github.com/xmm7360/xmm7360-pci.git
+cd xmm7360-pci
+make && make load
+cp xmm7360.ini.sample xmm7360.ini  # edit at least the apn in the configuration file
+sudo python3 rpc/open_xdatachannel.py
+sudo ip link set wwan0 up
+```
+Currently running sudo python3 rpc/open_xdatachannel.py after make load after a reboot and a script alone after hibernation is the only way it worked with no other package. It doesnt show up in NetworkManager but once script is finished running wwan0 obtains ip and internet connection is up. Might need an ip link wwan0 up. 
+
+P.S. I was trying everything recently and if steps mentioned above doesnt work or there is no signal check out https://github.com/juhovh/xmm7360_usb.
+
+I was testing different things prior to this and one of them was issuing AT commands below to set FCC lock and usb mode so the modem would work in mbim mode. 
+
+```
+at@nvm:fix_cat_fcclock.fcclock_mode?
+at@nvm:fix_cat_fcclock.fcclock_mode=0
+at@store_nvm(fix_cat_fcclock)
+AT+GTUSBMODE?
+AT+GTUSBMODE=7
+AT+CFUN?
+AT+CFUN=15
+```
 
 # Installing with DKMS
 Using DKMS (https://wiki.archlinux.org/title/Dynamic_Kernel_Module_Support) allows you to automate the **compilation** and **signing** of kernel modules, for example whenever you update your kernel.
