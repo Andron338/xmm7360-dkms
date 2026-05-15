@@ -48,6 +48,7 @@ except Exception as ex:
 
 ipr = IPRoute()
 
+# Step 1: modem init
 r.execute('UtaMsSmsInit')
 r.execute('UtaMsCbsInit')
 r.execute('UtaMsNetOpen')
@@ -57,9 +58,10 @@ r.execute('UtaMsSsInit')
 r.execute('UtaMsSimOpenReq')
 
 rpc.do_fcc_unlock(r)
-# disable aeroplane mode if had been FCC-locked. first and second args are probably don't-cares
+# disable aeroplane mode if had been FCC-locked
 rpc.UtaModeSet(r, 1)
 
+# Step 2: attach to network
 r.execute('UtaMsCallPsAttachApnConfigReq',
           rpc.pack_UtaMsCallPsAttachApnConfigReq(cfg.apn), is_async=True)
 
@@ -81,6 +83,18 @@ if status == 0xffffffff:
         logging.error("Attach failed again, giving up")
         sys.exit(1)
 
+# Step 3: open the data channel FIRST so wwan0 exists before we try to use it
+logging.info("Opening data channel...")
+pscr = r.execute('UtaMsCallPsConnectReq',
+                 rpc.pack_UtaMsCallPsConnectReq(), is_async=True)
+dcr = r.execute('UtaRPCPsConnectToDatachannelReq',
+                rpc.pack_UtaRPCPsConnectToDatachannelReq())
+
+csr_req = pscr['body'][:-6] + dcr['body'] + b'\x02\x04\0\0\0\0'
+r.execute('UtaRPCPSConnectSetupReq', csr_req)
+logging.info("Data channel open, wwan0 should now exist")
+
+# Step 4: now wwan0 exists, fetch IP
 while True:
     ip_addr, dns_values = rpc.get_ip(r)
     if ip_addr is not None:
@@ -92,6 +106,7 @@ while True:
 logging.info("IP address: " + str(ip_addr))
 logging.info("DNS server(s): " + ', '.join(map(str, dns_values['v4'] + dns_values['v6'])))
 
+# Step 5: configure wwan0
 idx = ipr.link_lookup(ifname='wwan0')[0]
 
 ipr.flush_addr(index=idx)
@@ -102,34 +117,25 @@ ipr.addr('add',
          index=idx,
          address=ip_addr)
 
-
 if not cfg.nodefaultroute:
     ipr.route('add',
               dst='default',
               priority=cfg.metric,
-              oif=idx)
+              gateway=ip_addr,
+              oif=idx,
+              scope='link')
 
-# Add DNS values to /etc/resolv.conf
+# Step 6: add DNS values to /etc/resolv.conf
 if not cfg.noresolv:
     with open('/etc/resolv.conf', 'a') as resolv:
         resolv.write('\n# Added by xmm7360\n')
         for dns in dns_values['v4'] + dns_values['v6']:
             resolv.write('nameserver %s\n' % dns)
 
-# this gives us way too much stuff, which we need
-pscr = r.execute('UtaMsCallPsConnectReq',
-                 rpc.pack_UtaMsCallPsConnectReq(), is_async=True)
-# this gives us a handle we need
-dcr = r.execute('UtaRPCPsConnectToDatachannelReq',
-                rpc.pack_UtaRPCPsConnectToDatachannelReq())
-
-csr_req = pscr['body'][:-6] + dcr['body'] + b'\x02\x04\0\0\0\0'
-
-r.execute('UtaRPCPSConnectSetupReq', csr_req)
-
 if not cfg.dbus:
-    sys.exit(1)
+    sys.exit(0)  # was sys.exit(1) in original, likely a bug
 
+# Step 7: configure NetworkManager via D-Bus
 myconnection = None
 system_bus = dbus.SystemBus()
 service_name = "org.freedesktop.NetworkManager"
@@ -198,6 +204,7 @@ if (myconnection is not None):
         config["ipv4"]["dns"] = dbus.Array([dbus.UInt32(ip) for ip in dbus_ip],
                                            signature=dbus.Signature("u")
                                            )
+        config["ipv4"]["dns-priority"] = cfg.metric
         settings_connection.Update(config)
 else:
     print("adding connection")
@@ -222,8 +229,10 @@ else:
     settings.AddConnection(add_con)
     get_connections()
 
-devices = manager.GetDevices()
+# Find wwan0 device path in NetworkManager
+devpath = None
 
+devices = manager.GetDevices()
 for d in devices:
     dev_proxy = system_bus.get_object("org.freedesktop.NetworkManager", d)
     prop_iface = dbus.Interface(dev_proxy, "org.freedesktop.DBus.Properties")
@@ -236,5 +245,10 @@ for d in devices:
             print("activate")
             prop_iface.Set("org.freedesktop.NetworkManager.Device",
                            "Managed", dbus.Boolean(1))
+        break
+
+if devpath is None:
+    logging.error("wwan0 not found in NetworkManager devices")
+    sys.exit(1)
 
 manager.ActivateConnection(connection_path, devpath, "/")
