@@ -1111,7 +1111,11 @@ static void xmm7360_net_setup(struct net_device *dev)
 {
 	struct xmm_net *xn = netdev_priv(dev);
 	spin_lock_init(&xn->lock);
+	#if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
 	hrtimer_init(&xn->deadline, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	#else
+	hrtimer_setup(&xn->deadline, NULL, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	#endif
 	xn->deadline.function = xmm7360_net_deadline_cb;
 	skb_queue_head_init(&xn->queue);
 
@@ -1277,17 +1281,45 @@ static void xmm7360_tty_close(struct tty_struct *tty, struct file *filp)
 	if (qp)
 		tty_port_close(&qp->port, tty, filp);
 }
-
-static int xmm7360_tty_write(struct tty_struct *tty,
-			     const unsigned char *buffer, int count)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+static long int xmm7360_tty_write(struct tty_struct *tty, const unsigned char *buffer, long unsigned int count)
 {
 	struct queue_pair *qp = tty->driver_data;
 	int written;
+
 	written = xmm7360_qp_write(qp, buffer, count);
-	if (written < count)
+
+	if (written < 0) {
+		// Error occurred during write
+		return written;
+	}
+
+	if (written < count) {
 		qp->tty_needs_wake = 1;
+	}
+
 	return written;
 }
+#else
+static ssize_t xmm7360_tty_write(struct tty_struct *tty, const unsigned char *buf, size_t count)
+{
+	struct queue_pair *qp = tty->driver_data;
+	ssize_t written;
+
+	written = xmm7360_qp_write(qp, buf, count);
+
+	if (written < 0) {
+		// Error occurred during write
+		return written;
+	}
+
+	if (written < count) {
+		qp->tty_needs_wake = 1;
+	}
+
+	return written;
+}
+#endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
 static unsigned xmm7360_tty_write_room(struct tty_struct *tty)
