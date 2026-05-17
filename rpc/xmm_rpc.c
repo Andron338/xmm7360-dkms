@@ -78,6 +78,18 @@ static void handle_unsolicited(xmm_rpc_t *rpc, const xmm_msg_t *m) {
     rpc_log("  unsolicited: %s (0x%03x)",
          name ? name : "unknown", m->code);
 
+    /* UtaMsNetRadioSignalIndCb (0x05a) — log signal so we can confirm
+     * the modem is measuring. 3GPP indices: RSRP = val-141 dBm,
+     * RSRQ = val/2-20 dB, RSSI = val-111 dBm */
+    if (m->code == 0x05a) {
+        xmm_reader_t sr;
+        xmm_reader_init(&sr, m->body, m->body_len);
+        uint32_t v[6] = {0};
+        for (int i = 0; i < 6; i++) unpack_u32(&sr, &v[i]);
+        rpc_log("  signal: rsrp=%ddBm rsrq=%ddB rssi=%ddBm",
+                (int)v[0] - 141, (int)(v[1] / 2) - 20, (int)v[2] - 111);
+    }
+
     /* UtaMsNetIsAttachAllowedIndCb — content[2] indicates whether attach ok */
     if (m->code == XMM_UNSOL_UtaMsNetIsAttachAllowedIndCb) {
         xmm_reader_t r;

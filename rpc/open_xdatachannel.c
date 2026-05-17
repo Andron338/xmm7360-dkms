@@ -194,6 +194,40 @@ int main(int argc, char *argv[]) {
     EXEC0(UtaMsCallPsInitialize);
     EXEC0(UtaMsSsInit);
     EXEC0(UtaMsSimOpenReq);
+
+    /* Enable signal strength reporting.
+     * Body = asn_int4(1): value 1 = ENABLE (0 = disable — the wrong
+     * default we had before). This arms UtaMsNetRadioSignalIndCb
+     * unsolicited messages and enables AT+XCESQ responses. */
+    {
+        xmm_buf_t sig_body;
+        xmm_buf_init(&sig_body);
+        pack_u32(&sig_body, 1);   /* enable = 1 */
+        if (xmm_rpc_execute(&rpc, XMM_CMD_UtaMsNetSetRadioSignalReporting,
+                            sig_body.data, sig_body.len, false, &resp) == 0)
+            xmm_msg_free(&resp);
+        xmm_buf_free(&sig_body);
+    }
+
+    /* UtaMsNetSetRadioSignalReportingConfiguration (0x188):
+     * pack(LLLLL): enable, rsrp_delta, rsrq_delta, rssi_delta, interval_sec
+     * Drives how often the modem measures and what threshold triggers a report. */
+    {
+        xmm_buf_t cfg_body;
+        xmm_buf_init(&cfg_body);
+        pack_u32(&cfg_body, 1);    /* enable               */
+        pack_u32(&cfg_body, 3);    /* RSRP delta  = 3 dB   */
+        pack_u32(&cfg_body, 3);    /* RSRQ delta  = 3 dB   */
+        pack_u32(&cfg_body, 3);    /* RSSI delta  = 3 dB   */
+        pack_u32(&cfg_body, 5);    /* interval    = 5 sec  */
+        if (xmm_rpc_execute(&rpc, XMM_CMD_UtaMsNetSetRadioSignalReportingConfiguration,
+                            cfg_body.data, cfg_body.len, false, &resp) == 0)
+            xmm_msg_free(&resp);
+        xmm_buf_free(&cfg_body);
+    }
+
+    /* One-shot immediate reading so signal appears without waiting */
+    EXEC0(UtaMsNetSingleShotRadioSignalReportingReq);
 #undef EXEC0
 
     /* ── Step 3: FCC unlock + enable RF ─────────────────────────────────── */
