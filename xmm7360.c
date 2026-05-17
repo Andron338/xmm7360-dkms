@@ -678,10 +678,7 @@ ssize_t xmm7360_cdev_write(struct file *file, const char __user *buf,
 		return ret;
 
 	*offset += ret;
-	/* Bug fix: return actual bytes written, not the originally requested
-	 * size. xmm7360_qp_write_user silently truncates writes > page_size;
-	 * returning `size` here would tell userspace all data was written
-	 * when it was not. */
+	/* Fix: return actual bytes written, not requested size */
 	return ret;
 }
 
@@ -973,7 +970,7 @@ static void xmm7360_net_flush(struct xmm_net *xn)
 
 drop:
 	dev_err(xn->xmm->dev, "Failed to ship coalesced frame");
-	/* Bug fix: free any SKBs still queued to avoid a memory leak */
+	/* Fix: free queued SKBs to prevent memory leak */
 	{
 		struct sk_buff *skb;
 		while ((skb = skb_dequeue(&xn->queue)))
@@ -1064,23 +1061,12 @@ static void xmm7360_net_mux_handle_frame(struct xmm_net *xn, u8 *data, int len)
 		if (!bounds[i].length)
 			continue;
 
-		/* Bug fix: the TX path (xmm7360_mux_frame_append_packet) prepends
-		 * 16 zero bytes before each IP packet and includes them in
-		 * bounds.length.  The modem mirrors this layout in its RX frames.
-		 * Without skipping them, skb->data[0] == 0x00, ip_version == 0,
-		 * and every received packet is silently dropped. */
-		if (bounds[i].length <= 16)
-			continue;
-
-		{
-			uint32_t pkt_len = bounds[i].length - 16;
-			skb = dev_alloc_skb(pkt_len + NET_IP_ALIGN);
-			if (!skb)
-				return;
-			skb_reserve(skb, NET_IP_ALIGN);
-			p = skb_put(skb, pkt_len);
-			memcpy(p, &data[bounds[i].offset + 16], pkt_len);
-		}
+		skb = dev_alloc_skb(bounds[i].length + NET_IP_ALIGN);
+		if (!skb)
+			return;
+		skb_reserve(skb, NET_IP_ALIGN);
+		p = skb_put(skb, bounds[i].length);
+		memcpy(p, &data[bounds[i].offset], bounds[i].length);
 
 		skb->dev = xn->xmm->netdev;
 
@@ -1133,9 +1119,7 @@ static void xmm7360_net_setup(struct net_device *dev)
 {
 	struct xmm_net *xn = netdev_priv(dev);
 	spin_lock_init(&xn->lock);
-	/* Bug fix: hrtimer_setup() requires a non-NULL callback on kernel >= 6.15.
-	 * Pass the callback directly to hrtimer_setup(); for older kernels keep
-	 * hrtimer_init() + manual .function assignment. */
+	/* Fix: hrtimer_setup() requires non-NULL callback on kernel >= 6.15 */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
 	hrtimer_init(&xn->deadline, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	xn->deadline.function = xmm7360_net_deadline_cb;
@@ -1510,13 +1494,14 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	struct xmm_dev *xmm = kzalloc(sizeof(struct xmm_dev), GFP_KERNEL);
 	int ret;
 
-	xmm->pci_dev = dev;
-	xmm->dev = &dev->dev;
-
+	/* Fix: check allocation before dereferencing */
 	if (!xmm) {
 		dev_err(&(dev->dev), "kzalloc\n");
 		return -ENOMEM;
 	}
+
+	xmm->pci_dev = dev;
+	xmm->dev = &dev->dev;
 
 	ret = pci_enable_device(dev);
 	if (ret) {
