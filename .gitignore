@@ -22,3 +22,6 @@ __pycache__
 *.cmd
 Module.symvers
 modules.order
+*.pkg.tar.zst
+src/
+pkg/

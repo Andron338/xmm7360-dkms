@@ -1,0 +1,16 @@
+# /usr/lib/udev/rules.d/80-xmm7360.rules
+#
+# 1. Tell ModemManager to use the Fibocom plugin (which knows AT+XCESQ for
+#    LTE signal) instead of the generic plugin (which only knows AT+CSQ).
+#
+# 2. Trigger xmm7360-init.service when the first AT port appears so the
+#    modem's SIM and signal subsystems are initialised before MM probes.
+
+# Tag ttyXMM ports for the Fibocom MM plugin
+SUBSYSTEM=="tty", KERNEL=="ttyXMM*", ENV{ID_MM_FIBOCOM_TAGGED}="1"
+
+# Trigger init on ttyXMM1 only (first AT port = module fully loaded).
+# Use systemd activation so the service runs exactly once and udev
+# doesn't block waiting for it to finish.
+SUBSYSTEM=="tty", KERNEL=="ttyXMM1", ACTION=="add", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="xmm7360-init.service"
