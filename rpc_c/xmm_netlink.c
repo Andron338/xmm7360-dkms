@@ -194,7 +194,10 @@ static int if_add_addr(int nlfd, int ifidx, uint32_t addr_ne) {
     req.ifa.ifa_family   = AF_INET;
     req.ifa.ifa_prefixlen = 32;
     req.ifa.ifa_index    = ifidx;
-    req.ifa.ifa_scope    = RT_SCOPE_HOST;
+    /* Bug fix: RT_SCOPE_HOST marks the address as loopback-only —
+     * the kernel never selects it as a source for outgoing traffic.
+     * RT_SCOPE_UNIVERSE (0) is correct for a routable interface addr. */
+    req.ifa.ifa_scope    = RT_SCOPE_UNIVERSE;
 
     addattr(&req.nlh, (int)sizeof(req), IFA_LOCAL,   &addr_ne, 4);
     addattr(&req.nlh, (int)sizeof(req), IFA_ADDRESS, &addr_ne, 4);
@@ -214,18 +217,24 @@ static int route_add_default(int nlfd, int ifidx, uint32_t gw_ne, uint32_t metri
     memset(&req, 0, sizeof(req));
     req.nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct rtmsg));
     req.nlh.nlmsg_type  = RTM_NEWROUTE;
-    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL;
+    /* Bug fix: NLM_F_EXCL fails if the route already exists (e.g. lte up
+     * run twice); use NLM_F_REPLACE so we overwrite stale entries.
+     * Bug fix: RT_SCOPE_LINK + RTA_GATEWAY is rejected by some kernels;
+     * RT_SCOPE_UNIVERSE is correct for a route with an explicit gateway. */
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
     req.rtm.rtm_family   = AF_INET;
     req.rtm.rtm_dst_len  = 0;       /* default route */
     req.rtm.rtm_src_len  = 0;
     req.rtm.rtm_table    = RT_TABLE_MAIN;
-    req.rtm.rtm_scope    = RT_SCOPE_LINK;
+    req.rtm.rtm_scope    = RT_SCOPE_UNIVERSE;
     req.rtm.rtm_type     = RTN_UNICAST;
     req.rtm.rtm_protocol = RTPROT_STATIC;
 
     addattr32(&req.nlh, (int)sizeof(req), RTA_OIF,      (uint32_t)ifidx);
     addattr(&req.nlh,   (int)sizeof(req), RTA_GATEWAY,  &gw_ne, 4);
     addattr32(&req.nlh, (int)sizeof(req), RTA_PRIORITY, metric);
+    /* Preferred source: steer the kernel to pick wwan0's own IP */
+    addattr(&req.nlh,   (int)sizeof(req), RTA_PREFSRC,  &gw_ne, 4);
 
     return nl_talk(nlfd, &req.nlh);
 }
@@ -261,8 +270,14 @@ int xmm_if_configure(const char *ifname,
     }
 
     if (add_route) {
-        if (route_add_default(nlfd, idx, addr_ne, (uint32_t)metric) < 0)
-            perror("xmm_if: add default route");   /* non-fatal, log only */
+        if (route_add_default(nlfd, idx, addr_ne, (uint32_t)metric) < 0) {
+            perror("xmm_if: add default route");
+            fprintf(stderr, "xmm_if: no default route — internet will not work\n");
+            /* non-fatal: interface is still up with IP assigned */
+        } else {
+            fprintf(stderr, "xmm_if: default route added via %s metric %d\n",
+                    ip_str, metric);
+        }
     }
 
 out:

@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <unistd.h>   /* usleep */
 #include <openssl/sha.h>
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
@@ -45,11 +45,19 @@ int xmm_rpc_open(xmm_rpc_t *rpc, const char *device_path) {
     const char **paths = device_path ? paths_single : defaults;
 
     for (int i = 0; paths[i]; i++) {
-        int fd = open(paths[i], O_RDWR | O_SYNC | O_CLOEXEC);
+        /* Match Python's os.open() flags exactly: O_RDWR | O_SYNC.
+         * Avoid O_CLOEXEC — some driver open() handlers inspect
+         * f_flags and unexpected bits can cause subtle failures
+         * with the custom xmm7360.c module. */
+        int fd = open(paths[i], O_RDWR | O_SYNC);
         if (fd >= 0) {
             rpc->fd = fd;
             rpc->attach_allowed = false;
             rpc_log("xmm_rpc: opened %s", paths[i]);
+            /* Give the custom xmm7360.c module a moment to finish
+             * xmm7360_qp_start() DMA ring initialisation before the
+             * first write.  iosm does not need this. */
+            usleep(50000);   /* 50 ms */
             return 0;
         }
         rpc_log("xmm_rpc: cannot open %s: %s", paths[i], strerror(errno));
@@ -89,18 +97,46 @@ static void handle_unsolicited(xmm_rpc_t *rpc, const xmm_msg_t *m) {
 int xmm_rpc_pump(xmm_rpc_t *rpc, xmm_msg_t *m) {
     static uint8_t buf[XMM_MAX_MSG];
 
-    ssize_t n = read(rpc->fd, buf, sizeof(buf));
+    /* Retry on EINTR: pkexec / fingerprint auth signals can interrupt read() */
+    ssize_t n;
+    do {
+        n = read(rpc->fd, buf, sizeof(buf));
+    } while (n < 0 && errno == EINTR);
+
     if (n < 0) { rpc_log("xmm_rpc: read error: %s", strerror(errno)); return -1; }
     if (n < 20) { rpc_log("xmm_rpc: message too short (%zd bytes)", n); return -1; }
 
     /*
      * Wire layout:
      *   [0..3]   LE uint32 total_length
-     *   [4..9]   asn_int4(total_length)   — \x02\x04 ...
+     *   [4..9]   asn_int4(total_length)
      *   [10..15] asn_int4(code)
      *   [16..19] BE uint32 txid
      *   [20..]   body
+     *
+     * The xmm7360 cdev returns a full DMA page (e.g. 16384 B) per read()
+     * regardless of actual message size; iosm returns the exact count.
+     * Clamp n via the LE total_length header field to discard DMA padding
+     * and leftover ring-buffer bytes that would corrupt body parsing.
      */
+    uint32_t total_len_hdr = (uint32_t)buf[0]         |
+                             ((uint32_t)buf[1] <<  8)  |
+                             ((uint32_t)buf[2] << 16)  |
+                             ((uint32_t)buf[3] << 24);
+    size_t msg_size = 4u + (size_t)total_len_hdr;
+
+    if (msg_size < 20) {
+        rpc_log("xmm_rpc: header claims implausibly small message (%zu B)"
+                " -- framing error", msg_size);
+        return -1;
+    }
+    if (msg_size > (size_t)n) {
+        rpc_log("xmm_rpc: header claims %zu B but only read %zd B"
+                " -- partial read or framing error", msg_size, n);
+        return -1;
+    }
+    n = (ssize_t)msg_size;   /* discard DMA-page padding */
+
     uint32_t txid = ((uint32_t)buf[16] << 24) | ((uint32_t)buf[17] << 16) |
                     ((uint32_t)buf[18] << 8)  |  (uint32_t)buf[19];
 
@@ -218,10 +254,19 @@ int xmm_rpc_execute(xmm_rpc_t     *rpc,
 
     rpc_log("xmm_rpc: execute cmd=0x%03x body=%zu B async=%d", cmd, body_len, is_async);
 
-    ssize_t w = write(rpc->fd, pkt, pkt_len);
+    /* xmm7360.c module returns ENOSPC without blocking when the DMA
+     * ring is full (unlike iosm which blocks). Retry a few times. */
+    ssize_t w = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        w = write(rpc->fd, pkt, pkt_len);
+        if (w >= 0) break;
+        if (errno != ENOSPC) break;
+        rpc_log("xmm_rpc: ring full (ENOSPC), retrying %d/10...", attempt + 1);
+        usleep(10000);   /* 10 ms */
+    }
     free(pkt);
     if (w < 0 || (size_t)w != pkt_len) {
-        rpc_log("xmm_rpc: write error: %s", strerror(errno));
+        rpc_log("xmm_rpc: write error after retries: %s", strerror(errno));
         return -1;
     }
 
