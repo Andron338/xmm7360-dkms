@@ -1,0 +1,173 @@
+.TH OPEN_XDATACHANNEL 8 "2025" "xmm7360-pci" "System Administration"
+.
+.SH NAME
+open_xdatachannel \- initialise and configure the Intel XMM7360 LTE modem
+.
+.SH SYNOPSIS
+.B open_xdatachannel
+.RB [ \-a
+.IR apn ]
+.RB [ \-i ]
+.RB [ \-D
+.IR device ]
+.RB [ \-n ]
+.RB [ \-m
+.IR metric ]
+.RB [ \-t
+.IR seconds ]
+.RB [ \-r ]
+.RB [ \-d ]
+.RB [ \-c
+.IR file ]
+.
+.SH DESCRIPTION
+.B open_xdatachannel
+initialises the Intel XMM7360 / Fibocom L850 LTE modem over its PCIe RPC
+channel, attaches to the mobile network, opens the data channel, and
+configures the
+.B wwan0
+network interface with the assigned IP address and default route.
+.PP
+It replaces the original Python-based
+.I open_xdatachannel.py
+with no runtime dependencies beyond standard system libraries.
+.PP
+When used with the
+.B xmm7360
+kernel module (recommended), run with
+.B \-\-init\-only
+to wake the modem and let ModemManager and NetworkManager handle the
+rest.  Full data-channel mode is intended for use with the
+.B iosm
+kernel module.
+.
+.SH OPTIONS
+.TP
+.BI \-a " apn" ", \-\-apn " apn
+Mobile network APN (e.g.\&
+.IR internet ).
+Required unless
+.B \-\-init\-only
+is used.
+.TP
+.B \-i ", \-\-init\-only"
+Initialise the modem (SIM, FCC unlock, RF on, signal reporting) then
+exit without opening the data channel.  Use this with the
+.B xmm7360
+kernel module so that ModemManager can detect the SIM and manage
+connectivity via NetworkManager.
+.TP
+.BI \-D " path" ", \-\-device " path
+Path to the RPC character device.
+Auto-detected if not specified; tries
+.I /dev/xmm0/rpc
+then
+.IR /dev/wwan0xmmrpc0 .
+.TP
+.B \-n ", \-\-nodefaultroute"
+Do not install the modem as the default route for IP traffic.
+.TP
+.BI \-m " metric" ", \-\-metric " metric
+Metric (priority) for the default route.  Higher values mean lower
+priority.  Default:
+.BR 1000 .
+.TP
+.BI \-t " seconds" ", \-\-ip\-fetch\-timeout " seconds
+Retry interval in seconds when polling for an IP address from the modem.
+Default:
+.BR 1 .
+.TP
+.B \-r ", \-\-noresolv"
+Do not append modem-provided DNS servers to
+.IR /etc/resolv.conf .
+.TP
+.B \-d ", \-\-dbus"
+Activate the connection via NetworkManager after configuring the
+interface.  Requires
+.BR libnm .
+.TP
+.BI \-c " file" ", \-\-conf " file
+Read configuration from
+.I file
+in addition to the default locations.
+.
+.SH INITIALISATION SEQUENCE
+Regardless of mode,
+.B open_xdatachannel
+always performs the following steps over the RPC channel:
+.PP
+.RS
+UtaMsCbsInit, UtaMsNetOpen, UtaMsCallCsInit, UtaMsCallPsInitialize,
+UtaMsSsInit, UtaMsSimOpenReq, FCC unlock, UtaModeSet(online),
+UtaMsNetSetRadioSignalReporting, UtaMsNetSetRadioSignalReportingConfiguration,
+UtaMsNetSingleShotRadioSignalReportingReq
+.RE
+.PP
+In full mode (without
+.BR \-\-init\-only )
+it then continues with network attach, data channel setup, IP
+configuration, and interface bring-up.
+.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure — error message written to standard error.
+.
+.SH FILES
+.TP
+.I /dev/xmm0/rpc
+RPC character device created by the
+.B xmm7360
+kernel module.
+.TP
+.I /dev/wwan0xmmrpc0
+RPC character device created by the
+.B iosm
+kernel module.
+.TP
+.I /etc/resolv.conf
+DNS nameservers provided by the modem are appended here unless
+.B \-\-noresolv
+is given.
+.
+.SH EXAMPLES
+Wake the modem for ModemManager (typical use with xmm7360 module):
+.PP
+.RS
+.B open_xdatachannel \-\-init\-only
+.RE
+.PP
+Full data-channel setup with iosm module:
+.PP
+.RS
+.B open_xdatachannel \-\-apn internet
+.RE
+.PP
+Full setup with explicit device path and no default route:
+.PP
+.RS
+.B open_xdatachannel \-a internet \-D /dev/wwan0xmmrpc0 \-n
+.RE
+.
+.SH SEE ALSO
+.BR mmcli (1),
+.BR nmcli (1),
+.BR ModemManager (8),
+.BR NetworkManager (8),
+.BR ip (8),
+.BR dkms (8)
+.
+.SH AUTHORS
+Originally developed as part of the
+.B xmm7360\-pci
+project.
+C port and packaging by contributors.
+.
+.SH BUGS
+Power management is not supported.  The modem loses its configuration on
+system suspend and must be reinitialised on resume.  Run
+.B open_xdatachannel \-\-init\-only
+after resume or configure a systemd sleep hook to do so automatically.

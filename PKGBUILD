@@ -65,6 +65,10 @@ package() {
         -C "$startdir/rpc" \
         DESTDIR="${pkgdir}" PREFIX=/usr install
 
+    # ── man page ────────────────────────────────────────────────────────
+    install -Dm644 "$startdir/open_xdatachannel.8" \
+        "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
+
     # ── udev rules ───────────────────────────────────────────────────────
     install -Dm644 "$startdir/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
@@ -77,13 +81,4 @@ package() {
     install -Dm644 "$startdir/xmm7360-modprobe.conf" \
         "${pkgdir}/usr/lib/modprobe.d/xmm7360.conf"
 
-    # ── Default config file (only installed if /etc/xmm7360.ini absent) ─
-    install -Dm644 /dev/null "${pkgdir}/etc/xmm7360.ini.example"
-    cat > "${pkgdir}/etc/xmm7360.ini.example" << 'EOF'
-# XMM7360 / Fibocom L850 configuration
-# Copy to /etc/xmm7360.ini and set your APN:
-#
-# apn    = internet
-# metric = 1000
-EOF
 }

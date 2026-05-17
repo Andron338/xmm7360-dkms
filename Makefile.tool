@@ -38,8 +38,11 @@ $(BIN): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+MANDIR  := $(PREFIX)/share/man/man8
+
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+	install -Dm644 ../open_xdatachannel.8 $(DESTDIR)$(MANDIR)/open_xdatachannel.8
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
