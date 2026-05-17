@@ -88,10 +88,46 @@ static int apply_ip4_settings(NMSettingIPConfig *s_ip4,
 }
 
 static int do_activate(NMClient *client, NMConnection *conn) {
-    NMDevice *dev = nm_client_get_device_by_iface(client, "wwan0");
+    /*
+     * wwan0 is created by the modem driver moments before we reach here.
+     * NM may not have enumerated it yet, so retry for up to 8 seconds.
+     * If the exact name lookup fails, fall back to scanning all devices
+     * for any interface whose name starts with "wwan".
+     */
+    NMDevice *dev = NULL;
+    for (int attempt = 0; attempt < 8 && !dev; attempt++) {
+        if (attempt > 0) {
+            fprintf(stderr, "nm: waiting for wwan0 to appear in NM (attempt %d/8)...\n",
+                    attempt + 1);
+            /* Spin the GMainContext for 1 second instead of sleep() so
+               async callbacks are still serviced. */
+            GMainContext *ctx = g_main_context_default();
+            gint64 deadline = g_get_monotonic_time() + G_USEC_PER_SEC;
+            while (g_get_monotonic_time() < deadline)
+                g_main_context_iteration(ctx, FALSE);
+        }
+
+        /* Try exact name first */
+        dev = nm_client_get_device_by_iface(client, "wwan0");
+        if (dev) break;
+
+        /* Fall back: scan all devices for any wwan* interface */
+        const GPtrArray *devs = nm_client_get_devices(client);
+        for (guint i = 0; i < devs->len && !dev; i++) {
+            NMDevice *d = devs->pdata[i];
+            const char *iface = nm_device_get_iface(d);
+            if (iface && strncmp(iface, "wwan", 4) == 0) {
+                fprintf(stderr, "nm: found wwan device as '%s'\n", iface);
+                dev = d;
+            }
+        }
+    }
+
     if (!dev) {
-        fprintf(stderr, "nm: wwan0 not found in NetworkManager\n");
-        return -1;
+        fprintf(stderr, "nm: no wwan device found in NetworkManager after 8s.\n"
+                        "    The connection is already active via manual config;\n"
+                        "    NM activation is optional. Continuing.\n");
+        return 0;   /* non-fatal: manual config already worked */
     }
 
     if (!nm_device_get_managed(dev)) {

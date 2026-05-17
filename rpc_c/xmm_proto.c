@@ -72,8 +72,8 @@ int pack_str(xmm_buf_t *b, const uint8_t *data, size_t valid_len, size_t max_len
     pack_u32(b, (uint32_t)(max_len - valid_len));
 
     /* payload */
-    if (data && valid_len)
-        xmm_buf_append(b, data, valid_len);
+    if (valid_len)
+        xmm_buf_append(b, data, valid_len);   /* data is never NULL; use pack_str_zeros for zero fields */
 
     /* zero padding */
     static const uint8_t Z[512];   /* static zero block */
@@ -87,7 +87,17 @@ int pack_str(xmm_buf_t *b, const uint8_t *data, size_t valid_len, size_t max_len
 }
 
 int pack_str_zeros(xmm_buf_t *b, size_t valid_len, size_t max_len) {
-    return pack_str(b, NULL, valid_len, max_len);
+    /*
+     * Do NOT pass NULL to pack_str: the NULL guard skips writing the
+     * valid_len payload bytes, leaving the body valid_len bytes short
+     * per field (907 B × 4 blocks = 3628 B missing, giving 1439 instead
+     * of ~5067 — enough to make the modem silently ignore the packet).
+     * Use a static zero buffer instead.
+     * 300 bytes covers the largest zero-fill we request (s260 → 257 B).
+     */
+    static const uint8_t Z[300];   /* BSS → guaranteed zero-initialised */
+    if (valid_len > sizeof(Z)) return -1;   /* should never happen */
+    return pack_str(b, Z, valid_len, max_len);
 }
 
 /* ── Unpack ───────────────────────────────────────────────────────────────── */
