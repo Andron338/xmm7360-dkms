@@ -171,11 +171,26 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Step 1: Open modem RPC interface ─────────────────────────────────── */
+    /* Retry for up to 5 seconds — the RPC device may appear slightly after
+     * ttyXMM1 which is what udev/systemd waits on. */
     xmm_rpc_t rpc;
-    if (xmm_rpc_open(&rpc, cfg.device[0] ? cfg.device : NULL) < 0) {
-        fprintf(stderr, "Hint: use --device to specify the RPC interface.\n"
-                        "      Try: ls /dev/wwan* /dev/xmm* 2>/dev/null\n");
-        return 1;
+    {
+        int _opened = 0;
+        for (int _i = 0; _i < 10; _i++) {
+            if (xmm_rpc_open(&rpc, cfg.device[0] ? cfg.device : NULL) == 0) {
+                _opened = 1;
+                break;
+            }
+            if (_i == 0)
+                fprintf(stderr, "RPC device not ready, retrying...\n");
+            struct timespec _ts = {0, 500000000}; /* 500 ms */
+            nanosleep(&_ts, NULL);
+        }
+        if (!_opened) {
+            fprintf(stderr, "Hint: use --device to specify the RPC interface.\n"
+                            "      Try: ls /dev/wwan* /dev/xmm* 2>/dev/null\n");
+            return 1;
+        }
     }
 
     /* ── Step 2: Modem init sequence ─────────────────────────────────────── */

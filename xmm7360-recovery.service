@@ -6,41 +6,43 @@ Type=oneshot
 RemainAfterExit=no
 
 ExecStart=/bin/sh -c '\
-    logger -t xmm7360-recovery "Starting modem recovery"; \
+    logger -t xmm7360-recovery "Starting recovery"; \
     \
     systemctl stop xmm7360-init.service 2>/dev/null || true; \
     rm -f /run/xmm7360-init.done; \
     \
-    logger -t xmm7360-recovery "Pausing NetworkManager to prevent reconnect race"; \
-    nmcli networking off; \
-    sleep 1; \
+    nmcli networking off 2>/dev/null || true; \
     \
-    logger -t xmm7360-recovery "Unloading xmm7360 module"; \
+    logger -t xmm7360-recovery "Unloading module"; \
     if ! modprobe -r xmm7360 2>/dev/null; then \
-        logger -t xmm7360-recovery "modprobe -r failed — stopping ModemManager and retrying"; \
+        logger -t xmm7360-recovery "modprobe -r failed — stopping ModemManager"; \
         systemctl stop ModemManager; \
-        for i in $(seq 1 10); do \
-            systemctl is-active --quiet ModemManager || break; \
-            sleep 0.5; \
-        done; \
-        modprobe -r xmm7360 || \
-            { logger -t xmm7360-recovery "ERROR: cannot unload module"; nmcli networking on; exit 1; }; \
+        modprobe -r xmm7360 || { \
+            logger -t xmm7360-recovery "ERROR: cannot unload module"; \
+            nmcli networking on 2>/dev/null || true; \
+            exit 1; \
+        }; \
     fi; \
     \
-    logger -t xmm7360-recovery "Loading xmm7360 module"; \
+    logger -t xmm7360-recovery "Loading module"; \
     modprobe xmm7360; \
-    sleep 1; \
     \
-    logger -t xmm7360-recovery "Running RPC init"; \
+    logger -t xmm7360-recovery "Waiting for devices"; \
+    udevadm settle; \
+    \
+    logger -t xmm7360-recovery "Starting RPC init"; \
     systemctl start xmm7360-init.service; \
     \
     logger -t xmm7360-recovery "Restarting ModemManager"; \
     systemctl restart ModemManager; \
     \
-    logger -t xmm7360-recovery "Resuming NetworkManager"; \
-    nmcli networking on; \
+    logger -t xmm7360-recovery "Waiting for modem to register with MM"; \
+    for i in $(seq 1 30); do \
+        mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
+        sleep 1; \
+    done; \
     \
-    mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
+    nmcli networking on 2>/dev/null || true; \
     \
     logger -t xmm7360-recovery "Recovery complete"'
 

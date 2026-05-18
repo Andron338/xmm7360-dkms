@@ -8,14 +8,18 @@ ConditionPathExists=!/run/xmm7360-init.done
 Type=oneshot
 RemainAfterExit=yes
 
-ExecStartPre=/usr/bin/sleep 0.1
+EnvironmentFile=-/etc/xmm7360.conf
 
-# Wake modem: SIM, FCC unlock, RF on, signal reporting.
-# ModemManager handles network attach and bearer (ppp0) via AT ports.
 ExecStart=/usr/bin/open_xdatachannel --init-only
 
 ExecStartPost=/usr/bin/touch /run/xmm7360-init.done
-ExecStartPost=/bin/sh -c 'sleep 3 && mmcli -m 0 --signal-setup=5 || true'
+
+# Retry signal setup until MM actually has the modem — no fixed delays
+ExecStartPost=/bin/sh -c '\
+    for i in $(seq 1 30); do \
+        mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
+        sleep 1; \
+    done || true'
 
 ExecStop=/usr/bin/rm -f /run/xmm7360-init.done
 

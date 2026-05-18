@@ -6,6 +6,12 @@
 # 2. Trigger xmm7360-init.service when the first AT port appears so the
 #    modem's SIM and signal subsystems are initialised before MM probes.
 
+# Prevent PCIe runtime power management from auto-suspending the modem.
+# Without this the kernel may power off the device after idle time.
+ACTION=="add", SUBSYSTEM=="pci", \
+    ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
+    ATTR{power/control}="on"
+
 # Tag ttyXMM ports for the Fibocom MM plugin
 SUBSYSTEM=="tty", KERNEL=="ttyXMM*", ENV{ID_MM_FIBOCOM_TAGGED}="1"
 
