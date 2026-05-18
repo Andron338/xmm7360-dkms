@@ -25,3 +25,4 @@ modules.order
 *.pkg.tar.zst
 src/
 pkg/
+xmm7360-pci
