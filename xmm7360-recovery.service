@@ -1,6 +1,5 @@
 [Unit]
 Description=XMM7360 Modem Recovery (module reload + reinit)
-Conflicts=xmm7360-init.service
 
 [Service]
 Type=oneshot
@@ -9,21 +8,20 @@ RemainAfterExit=no
 ExecStart=/bin/sh -c '\
     logger -t xmm7360-recovery "Starting modem recovery"; \
     \
+    systemctl stop xmm7360-init.service 2>/dev/null || true; \
     rm -f /run/xmm7360-init.done; \
     \
-    logger -t xmm7360-recovery "Stopping ModemManager"; \
-    systemctl stop ModemManager; \
-    \
-    logger -t xmm7360-recovery "Verifying ModemManager is stopped"; \
-    for i in $(seq 1 10); do \
-        systemctl is-active --quiet ModemManager || break; \
-        sleep 0.5; \
-    done; \
-    systemctl is-active --quiet ModemManager && \
-        { logger -t xmm7360-recovery "ERROR: ModemManager still running"; exit 1; }; \
-    \
     logger -t xmm7360-recovery "Unloading xmm7360 module"; \
-    modprobe -r xmm7360; \
+    if ! modprobe -r xmm7360 2>/dev/null; then \
+        logger -t xmm7360-recovery "modprobe -r failed — stopping ModemManager and retrying"; \
+        systemctl stop ModemManager; \
+        for i in $(seq 1 10); do \
+            systemctl is-active --quiet ModemManager || break; \
+            sleep 0.5; \
+        done; \
+        modprobe -r xmm7360 || \
+            { logger -t xmm7360-recovery "ERROR: cannot unload module"; exit 1; }; \
+    fi; \
     \
     logger -t xmm7360-recovery "Loading xmm7360 module"; \
     modprobe xmm7360; \
@@ -32,8 +30,8 @@ ExecStart=/bin/sh -c '\
     logger -t xmm7360-recovery "Running RPC init"; \
     systemctl start xmm7360-init.service; \
     \
-    logger -t xmm7360-recovery "Starting ModemManager"; \
-    systemctl start ModemManager; \
+    logger -t xmm7360-recovery "Restarting ModemManager"; \
+    systemctl restart ModemManager; \
     \
     mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
     \
