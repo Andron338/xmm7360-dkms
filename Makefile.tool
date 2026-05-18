@@ -27,28 +27,36 @@ SRCS := \
 
 OBJS := $(SRCS:.c=.o)
 BIN  := open_xdatachannel
+WATCH := xmm7360-watch
+GIO_CFLAGS := $(shell pkg-config --cflags gio-2.0 2>/dev/null)
+GIO_LIBS   := $(shell pkg-config --libs   gio-2.0 2>/dev/null)
 
 .PHONY: all clean install uninstall
 
-all: $(BIN)
+all: $(BIN) $(WATCH)
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(WATCH): xmm7360-watch.c
+	$(CC) $(CFLAGS) $(GIO_CFLAGS) -o $@ $< $(GIO_LIBS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 MANDIR  := $(PREFIX)/share/man/man8
 
-install: $(BIN)
-	install -Dm755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+install: $(BIN) $(WATCH)
+	install -Dm755 $(BIN)   $(DESTDIR)$(BINDIR)/$(BIN)
+	install -Dm755 $(WATCH) $(DESTDIR)$(BINDIR)/$(WATCH)
 	install -Dm644 ../open_xdatachannel.8 $(DESTDIR)$(MANDIR)/open_xdatachannel.8
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+	rm -f $(DESTDIR)$(BINDIR)/$(WATCH)
 
 clean:
-	rm -f $(OBJS) $(BIN)
+	rm -f $(OBJS) $(BIN) $(WATCH)
 
 # Header dependencies
 open_xdatachannel.o: open_xdatachannel.c xmm_rpc.h xmm_rpc_ids.h xmm_netlink.h xmm_nm.h xmm_proto.h

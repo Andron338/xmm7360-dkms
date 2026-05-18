@@ -2,11 +2,11 @@
 # AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
 pkgname=xmm7360-dkms-git
-pkgver=r265.g78a394c   # updated by pkgver() below
+pkgver=r1.g0000000   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
-url="https://github.com/Andron338/xmm7360-pci"
+url="https://github.com/YOUR_USERNAME/xmm7360-pci"
 license=('GPL2')
 
 depends=(
@@ -70,6 +70,11 @@ package() {
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
 
+    # ── watch daemon (D-Bus state monitor, replaces NM dispatcher) ───────
+    install -Dm644 "$_src/xmm7360-watch.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
+    # binary installed by Makefile.tool install target above
+
     # ── recovery service (disconnect + suspend) ─────────────────────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
@@ -81,10 +86,6 @@ package() {
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
     install -Dm644 "$_src/xmm7360-modprobe.conf" \
         "${pkgdir}/usr/lib/modprobe.d/xmm7360.conf"
-
-    # ── NM dispatcher (disconnect recovery) ──────────────────────────────
-    install -Dm755 "$_src/99-xmm7360-dispatcher" \
-        "${pkgdir}/etc/NetworkManager/dispatcher.d/99-xmm7360"
 
     # ── Default config ───────────────────────────────────────────────────
     install -Dm644 /dev/null "${pkgdir}/etc/xmm7360.conf"
