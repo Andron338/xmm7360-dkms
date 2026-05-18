@@ -1,0 +1,2 @@
+# tests/Kbuild — kernel build file for KUnit tests
+obj-$(CONFIG_XMM7360_KUNIT_TEST) += xmm7360_test.o
