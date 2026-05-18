@@ -1,17 +1,19 @@
 #!/bin/bash
 # /usr/lib/systemd/system-sleep/xmm7360
+#
+# Only handles PRE-suspend cleanup.
+# Post-resume is handled by xmm7360-resume.service which systemd
+# starts after suspend/hibernate targets with proper ordering.
 
 case "$1" in
     pre)
-        logger -t xmm7360-sleep "pre-suspend: clearing sentinel"
+        logger -t xmm7360-sleep "pre-suspend: preparing modem for sleep"
         rm -f /run/xmm7360-init.done
         ip link set wwan0 down 2>/dev/null || true
-        sed -i '/# Added by xmm7360/,/^[^#]/{ /# Added by xmm7360/d; /^nameserver/d }' \
-            /etc/resolv.conf 2>/dev/null || true
         ;;
     post)
-        logger -t xmm7360-sleep "post-resume: triggering recovery"
-        sleep 1
-        systemctl start xmm7360-recovery.service
+        # Nothing here — xmm7360-resume.service handles this
+        # with proper After=ModemManager.service ordering
+        logger -t xmm7360-sleep "post-resume: handing off to xmm7360-resume.service"
         ;;
 esac

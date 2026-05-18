@@ -6,7 +6,7 @@ pkgver=r1.g0000000   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
-url="https://github.com/Andron338/xmm7360-pci"
+url="https://github.com/YOUR_USERNAME/xmm7360-pci"
 license=('GPL2')
 
 depends=(
@@ -49,7 +49,7 @@ package() {
     local _dkms_src="/usr/src/${_module}-${pkgver}"
 
     # ── Kernel module source for DKMS ────────────────────────────────────
-    install -dm755                      "${pkgdir}${_dkms_src}"
+    install -dm755                  "${pkgdir}${_dkms_src}"
     install -m644 "$_src/xmm7360.c"     "${pkgdir}${_dkms_src}/"
     install -m644 "$_src/Makefile.dkms" "${pkgdir}${_dkms_src}/Makefile"
     install -m644 "$_src/dkms.conf"     "${pkgdir}${_dkms_src}/"
@@ -59,12 +59,6 @@ package() {
     install -Dm755 "$_src/rpc/open_xdatachannel" \
         "${pkgdir}/usr/bin/open_xdatachannel"
 
-    # ── D-Bus state monitor daemon ───────────────────────────────────────
-    install -Dm755 "$_src/rpc/xmm7360-watch" \
-        "${pkgdir}/usr/bin/xmm7360-watch"
-    install -Dm644 "$_src/xmm7360-watch.service" \
-        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
-
     # ── Man page ─────────────────────────────────────────────────────────
     install -Dm644 "$_src/open_xdatachannel.8" \
         "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
@@ -73,15 +67,28 @@ package() {
     install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
-    # ── systemd services ─────────────────────────────────────────────────
+    # ── systemd service ──────────────────────────────────────────────────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
+
+    # ── watch daemon (D-Bus state monitor, replaces NM dispatcher) ───────
+    install -Dm755 "$_src/rpc/xmm7360-watch" \
+        "${pkgdir}/usr/bin/xmm7360-watch"
+    install -Dm644 "$_src/xmm7360-watch.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
+
+    # ── recovery service (disconnect + suspend) ─────────────────────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
 
-    # ── suspend/resume sleep hook ────────────────────────────────────────
+    # ── suspend/resume sleep hook (pre-suspend only) ───────────────────
     install -Dm755 "$_src/xmm7360-sleep" \
         "${pkgdir}/usr/lib/systemd/system-sleep/xmm7360"
+
+    # ── post-resume service (proper ordering after MM) ───────────────────
+    install -Dm644 "$_src/xmm7360-resume.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-resume.service"
+
 
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
     install -Dm644 "$_src/xmm7360-modprobe.conf" \
