@@ -1,32 +1,22 @@
 [Unit]
 Description=XMM7360 Modem RPC Initialisation
-# The ttyXMM device triggers us via udev; wait for it to settle
 After=dev-ttyXMM1.device
-# Run before ModemManager gets a chance to probe the (not-yet-init'd) modem.
-# MM retries on SIM-missing so even if there is a race we recover, but
-# ordering here minimises the retry delay.
 Before=ModemManager.service
-# Only run once per boot — if the modem resets and re-enumerates the
-# sentinel file is gone and the service can run again.
 ConditionPathExists=!/run/xmm7360-init.done
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 
-# Give the PCIe device 100 ms to settle after ttyXMM1 appears
 ExecStartPre=/usr/bin/sleep 0.1
 
+# Wake modem: SIM, FCC unlock, RF on, signal reporting.
+# ModemManager handles network attach and bearer (ppp0) via AT ports.
 ExecStart=/usr/bin/open_xdatachannel --init-only
 
-# Mark as done so we don't re-run until reboot
 ExecStartPost=/usr/bin/touch /run/xmm7360-init.done
+ExecStartPost=/bin/sh -c 'sleep 3 && mmcli -m 0 --signal-setup=5 || true'
 
-# After SIM is accessible, tell MM to poll signal every 5 s.
-# '|| true' so a timing miss doesn't fail the service.
-ExecStartPost=/bin/sh -c 'sleep 2 && mmcli -m 0 --signal-setup=5 || true'
-
-# Clean up sentinel on stop so a manual reload works
 ExecStop=/usr/bin/rm -f /run/xmm7360-init.done
 
 StandardOutput=journal

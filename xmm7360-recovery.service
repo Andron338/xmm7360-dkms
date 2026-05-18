@@ -1,0 +1,34 @@
+[Unit]
+Description=XMM7360 Modem Recovery (module reload + reinit)
+# Conflicts with the init service so they don't step on each other
+Conflicts=xmm7360-init.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+
+ExecStart=/bin/sh -c '\
+    logger -t xmm7360-recovery "Starting modem recovery"; \
+    \
+    rm -f /run/xmm7360-init.done; \
+    \
+    mmcli -m 0 --disable 2>/dev/null || true; \
+    sleep 0.5; \
+    \
+    systemctl stop ModemManager; \
+    \
+    modprobe -r xmm7360 2>/dev/null || true; \
+    sleep 0.5; \
+    modprobe xmm7360; \
+    sleep 1; \
+    \
+    systemctl start xmm7360-init.service; \
+    \
+    systemctl start ModemManager; \
+    \
+    mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
+    \
+    logger -t xmm7360-recovery "Recovery complete"'
+
+StandardOutput=journal
+StandardError=journal

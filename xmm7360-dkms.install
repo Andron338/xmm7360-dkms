@@ -15,6 +15,7 @@ post_install() {
     udevadm control --reload-rules
 
     echo ">>> Enabling xmm7360-init.service..."
+    systemctl daemon-reload
     systemctl enable xmm7360-init.service
 
     echo ""
@@ -47,6 +48,8 @@ pre_remove() {
 
     echo ">>> Unloading xmm7360 module..."
     modprobe -r xmm7360 2>/dev/null || true
+
+    rm -f /usr/lib/systemd/system-sleep/xmm7360
 
     echo ">>> NOTE: iosm blacklist removed. Reboot to restore iosm."
 }

@@ -1,84 +1,96 @@
 # Maintainer: Your Name <you@example.com>
-#
-# Place this PKGBUILD at the root of the xmm7360-pci repo alongside:
-#   xmm7360.c          (the fixed kernel module)
-#   dkms.conf
-#   Makefile.dkms      (kernel module Makefile for DKMS)
-#   Makefile.tool      (rpc tool Makefile)
-#   80-xmm7360.rules
-#   xmm7360-init.service
-#   xmm7360-modprobe.conf
-#   xmm7360-dkms.install
-#   rpc/             (all .c/.h source files)
-#
-# Build and install:
-#   makepkg -si
+# AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
-pkgname=xmm7360-dkms
-pkgver=1.0.0
+pkgname=xmm7360-dkms-git
+pkgver=r261.g3cd00ca   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
-url="https://github.com/xmm7360/xmm7360-pci"
+url="https://github.com/Andron338/xmm7360-pci"
 license=('GPL2')
 
 depends=(
     'dkms'
     'libnm'
     'openssl'
-    'util-linux-libs'   # libuuid
+    'util-linux-libs'
     'networkmanager'
     'modemmanager'
 )
-makedepends=('linux-headers')
-optdepends=('linux-headers: required by DKMS to build on kernel update')
+makedepends=('linux-headers' 'git')
+optdepends=('linux-headers: required by DKMS on kernel update')
 
 provides=('xmm7360-dkms')
-conflicts=('xmm7360' 'xmm7360-git' 'xmm7360-pci-dkms')
-install="${pkgname}.install"
+conflicts=('xmm7360' 'xmm7360-dkms' 'xmm7360-git' 'xmm7360-pci-dkms')
+install="${pkgname%-git}.install"
 
-# No remote source — build from the local repo tree.
-# makepkg must be run from the repo root.
-source=()
-sha256sums=()
+source=("xmm7360-pci::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/xmm7360-pci"
+    printf "r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$srcdir/xmm7360-pci/rpc"
+    make -f ../Makefile.tool clean 2>/dev/null || true
+}
 
 build() {
-    # ── RPC userspace tool ──────────────────────────────────────────────
-    cd "$startdir/rpc"
-    make -f "$startdir/Makefile.tool" clean
-    make -f "$startdir/Makefile.tool"
+    cd "$srcdir/xmm7360-pci/rpc"
+    make -f ../Makefile.tool
 }
 
 package() {
+    local _src="$srcdir/xmm7360-pci"
     local _module="xmm7360"
     local _dkms_src="/usr/src/${_module}-${pkgver}"
 
-    # ── Kernel module source for DKMS ───────────────────────────────────
-    install -dm755 "${pkgdir}${_dkms_src}"
-    install -m644 "$startdir/xmm7360.c"    "${pkgdir}${_dkms_src}/"
-    install -m644 "$startdir/Makefile.dkms" "${pkgdir}${_dkms_src}/Makefile"
-    install -m644 "$startdir/dkms.conf"    "${pkgdir}${_dkms_src}/"
+    # ── Kernel module source for DKMS ────────────────────────────────────
+    install -dm755                  "${pkgdir}${_dkms_src}"
+    install -m644 "$_src/xmm7360.c"     "${pkgdir}${_dkms_src}/"
+    install -m644 "$_src/Makefile.dkms" "${pkgdir}${_dkms_src}/Makefile"
+    install -m644 "$_src/dkms.conf"     "${pkgdir}${_dkms_src}/"
     sed -i "s/@VERSION@/${pkgver}/" "${pkgdir}${_dkms_src}/dkms.conf"
 
     # ── RPC userspace tool ───────────────────────────────────────────────
-    make -f "$startdir/Makefile.tool" \
-        -C "$startdir/rpc" \
-        DESTDIR="${pkgdir}" PREFIX=/usr install
+    install -Dm755 "$_src/rpc/open_xdatachannel" \
+        "${pkgdir}/usr/bin/open_xdatachannel"
 
-    # ── man page ────────────────────────────────────────────────────────
-    install -Dm644 "$startdir/open_xdatachannel.8" \
+    # ── Man page ─────────────────────────────────────────────────────────
+    install -Dm644 "$_src/open_xdatachannel.8" \
         "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
 
     # ── udev rules ───────────────────────────────────────────────────────
-    install -Dm644 "$startdir/80-xmm7360.rules" \
+    install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
     # ── systemd service ──────────────────────────────────────────────────
-    install -Dm644 "$startdir/xmm7360-init.service" \
+    install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
 
+    # ── recovery service (disconnect + suspend) ─────────────────────────
+    install -Dm644 "$_src/xmm7360-recovery.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
+
+    # ── suspend/resume sleep hook ────────────────────────────────────────
+    install -Dm755 "$_src/xmm7360-sleep" \
+        "${pkgdir}/usr/lib/systemd/system-sleep/xmm7360"
+
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
-    install -Dm644 "$startdir/xmm7360-modprobe.conf" \
+    install -Dm644 "$_src/xmm7360-modprobe.conf" \
         "${pkgdir}/usr/lib/modprobe.d/xmm7360.conf"
 
+    # ── NM dispatcher (disconnect recovery) ──────────────────────────────
+    install -Dm755 "$_src/99-xmm7360-dispatcher" \
+        "${pkgdir}/etc/NetworkManager/dispatcher.d/99-xmm7360"
+
+    # ── Default config ───────────────────────────────────────────────────
+    install -Dm644 /dev/null "${pkgdir}/etc/xmm7360.conf"
+    printf '%s\n' \
+        "# XMM7360 / Fibocom L850 configuration" \
+        "XMM_APN=internet" \
+        "XMM_METRIC=1000" \
+        > "${pkgdir}/etc/xmm7360.conf"
 }
