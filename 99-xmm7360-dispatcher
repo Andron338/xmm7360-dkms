@@ -1,15 +1,17 @@
 #!/bin/bash
 # /etc/NetworkManager/dispatcher.d/99-xmm7360
+# Must be owned by root, chmod 755, no world-write
 
 IFACE="$1"
 ACTION="$2"
 
+logger -t xmm7360-dispatcher "called: iface=$IFACE action=$ACTION"
+
 [[ "$IFACE" == ppp* || "$IFACE" == "wwan0" ]] || exit 0
 [ "$ACTION" = "down" ] || exit 0
 
-logger -t xmm7360-dispatcher "$IFACE went down — triggering recovery"
+logger -t xmm7360-dispatcher "$IFACE went down — triggering recovery service"
 
-# --no-block so NM doesn't wait for recovery to complete
-systemctl start --no-block xmm7360-recovery.service
+systemctl restart --no-block xmm7360-recovery.service
 
 exit 0

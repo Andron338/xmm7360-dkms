@@ -14,6 +14,10 @@ post_install() {
     echo ">>> Reloading udev rules..."
     udevadm control --reload-rules
 
+    echo ">>> Ensuring NetworkManager dispatcher is enabled..."
+    systemctl unmask NetworkManager-dispatcher.service 2>/dev/null || true
+    systemctl enable --now NetworkManager-dispatcher.service 2>/dev/null || true
+
     echo ">>> Enabling xmm7360-init.service..."
     systemctl daemon-reload
     systemctl enable xmm7360-init.service
@@ -25,6 +29,9 @@ post_install() {
 }
 
 post_upgrade() {
+    systemctl unmask NetworkManager-dispatcher.service 2>/dev/null || true
+    systemctl enable --now NetworkManager-dispatcher.service 2>/dev/null || true
+
     local ver
     ver=$(ls /usr/src | grep "^${_pkgname}-" | sort -V | tail -1 | sed "s/${_pkgname}-//")
 

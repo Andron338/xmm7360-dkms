@@ -11,6 +11,10 @@ ExecStart=/bin/sh -c '\
     systemctl stop xmm7360-init.service 2>/dev/null || true; \
     rm -f /run/xmm7360-init.done; \
     \
+    logger -t xmm7360-recovery "Pausing NetworkManager to prevent reconnect race"; \
+    nmcli networking off; \
+    sleep 1; \
+    \
     logger -t xmm7360-recovery "Unloading xmm7360 module"; \
     if ! modprobe -r xmm7360 2>/dev/null; then \
         logger -t xmm7360-recovery "modprobe -r failed — stopping ModemManager and retrying"; \
@@ -20,7 +24,7 @@ ExecStart=/bin/sh -c '\
             sleep 0.5; \
         done; \
         modprobe -r xmm7360 || \
-            { logger -t xmm7360-recovery "ERROR: cannot unload module"; exit 1; }; \
+            { logger -t xmm7360-recovery "ERROR: cannot unload module"; nmcli networking on; exit 1; }; \
     fi; \
     \
     logger -t xmm7360-recovery "Loading xmm7360 module"; \
@@ -32,6 +36,9 @@ ExecStart=/bin/sh -c '\
     \
     logger -t xmm7360-recovery "Restarting ModemManager"; \
     systemctl restart ModemManager; \
+    \
+    logger -t xmm7360-recovery "Resuming NetworkManager"; \
+    nmcli networking on; \
     \
     mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
     \
