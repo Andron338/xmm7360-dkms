@@ -1,0 +1,9 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = true
+[remote "origin"]
+	url = https://github.com/Andron338/xmm7360-pci.git
+	tagOpt = --no-tags
+	fetch = +refs/*:refs/*
+	mirror = true

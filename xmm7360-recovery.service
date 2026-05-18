@@ -1,6 +1,5 @@
 [Unit]
 Description=XMM7360 Modem Recovery (module reload + reinit)
-# Conflicts with the init service so they don't step on each other
 Conflicts=xmm7360-init.service
 
 [Service]
@@ -12,18 +11,28 @@ ExecStart=/bin/sh -c '\
     \
     rm -f /run/xmm7360-init.done; \
     \
-    mmcli -m 0 --disable 2>/dev/null || true; \
-    sleep 0.5; \
-    \
+    logger -t xmm7360-recovery "Stopping ModemManager"; \
     systemctl stop ModemManager; \
     \
-    modprobe -r xmm7360 2>/dev/null || true; \
-    sleep 0.5; \
+    logger -t xmm7360-recovery "Verifying ModemManager is stopped"; \
+    for i in $(seq 1 10); do \
+        systemctl is-active --quiet ModemManager || break; \
+        sleep 0.5; \
+    done; \
+    systemctl is-active --quiet ModemManager && \
+        { logger -t xmm7360-recovery "ERROR: ModemManager still running"; exit 1; }; \
+    \
+    logger -t xmm7360-recovery "Unloading xmm7360 module"; \
+    modprobe -r xmm7360; \
+    \
+    logger -t xmm7360-recovery "Loading xmm7360 module"; \
     modprobe xmm7360; \
     sleep 1; \
     \
+    logger -t xmm7360-recovery "Running RPC init"; \
     systemctl start xmm7360-init.service; \
     \
+    logger -t xmm7360-recovery "Starting ModemManager"; \
     systemctl start ModemManager; \
     \
     mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
