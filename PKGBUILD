@@ -16,6 +16,7 @@ depends=(
     'util-linux-libs'
     'networkmanager'
     'modemmanager'
+    'glib2'
 )
 makedepends=('linux-headers' 'git')
 optdepends=('linux-headers: required by DKMS on kernel update')
@@ -48,7 +49,7 @@ package() {
     local _dkms_src="/usr/src/${_module}-${pkgver}"
 
     # ── Kernel module source for DKMS ────────────────────────────────────
-    install -dm755                  "${pkgdir}${_dkms_src}"
+    install -dm755                      "${pkgdir}${_dkms_src}"
     install -m644 "$_src/xmm7360.c"     "${pkgdir}${_dkms_src}/"
     install -m644 "$_src/Makefile.dkms" "${pkgdir}${_dkms_src}/Makefile"
     install -m644 "$_src/dkms.conf"     "${pkgdir}${_dkms_src}/"
@@ -58,6 +59,12 @@ package() {
     install -Dm755 "$_src/rpc/open_xdatachannel" \
         "${pkgdir}/usr/bin/open_xdatachannel"
 
+    # ── D-Bus state monitor daemon ───────────────────────────────────────
+    install -Dm755 "$_src/rpc/xmm7360-watch" \
+        "${pkgdir}/usr/bin/xmm7360-watch"
+    install -Dm644 "$_src/xmm7360-watch.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
+
     # ── Man page ─────────────────────────────────────────────────────────
     install -Dm644 "$_src/open_xdatachannel.8" \
         "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
@@ -66,16 +73,9 @@ package() {
     install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
-    # ── systemd service ──────────────────────────────────────────────────
+    # ── systemd services ─────────────────────────────────────────────────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
-
-    # ── watch daemon (D-Bus state monitor, replaces NM dispatcher) ───────
-    install -Dm644 "$_src/xmm7360-watch.service" \
-        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
-    # binary installed by Makefile.tool install target above
-
-    # ── recovery service (disconnect + suspend) ─────────────────────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
 
