@@ -294,6 +294,69 @@ int xmm_rpc_execute(xmm_rpc_t     *rpc,
 
 /* ── FCC unlock ───────────────────────────────────────────────────────────── */
 
+int xmm_rpc_disconnect(xmm_rpc_t *rpc)
+{
+    xmm_msg_t resp;
+    xmm_buf_t body;
+    int ret;
+
+    rpc_log("disconnect: releasing RPC data channel");
+
+    /*
+     * Step 1: UtaRPCPSConnectReleaseReq (0x07F)
+     * Tells the modem the host-side RPC data channel is closing.
+     * Use default body (asn_int4(0)). Ignore errors — the channel
+     * may already be gone if MM hung up via AT commands first.
+     */
+    ret = xmm_rpc_execute(rpc, XMM_CMD_UtaRPCPSConnectReleaseReq,
+                          NULL, 0, false, &resp);
+    if (ret == 0)
+        xmm_msg_free(&resp);
+    else
+        rpc_log("disconnect: UtaRPCPSConnectReleaseReq failed (ok if already released)");
+
+    /*
+     * Step 2: UtaMsCallPsDeactivateReq (0x04E)
+     * Deactivates the PDP context. Body: asn_int4(0) = cause 0 (normal).
+     * After this the modem is in "attached, no data channel" state —
+     * exactly where we need it so --init-only can reinitialise without
+     * a module reload.
+     */
+    xmm_buf_init(&body);
+    pack_u32(&body, 0);   /* cause = 0: normal local deactivation */
+
+    rpc_log("disconnect: deactivating PDP context");
+    ret = xmm_rpc_execute(rpc, XMM_CMD_UtaMsCallPsDeactivateReq,
+                          body.data, body.len, false, &resp);
+    xmm_buf_free(&body);
+
+    if (ret == 0) {
+        xmm_msg_free(&resp);
+
+        /*
+         * Step 3: pump briefly for UtaMsCallPsDeactivateRspCb (0x04F)
+         * or UtaMsCallPsDeactivateIndCb (0x050) to confirm teardown.
+         * We consume up to 20 messages or stop on confirmation.
+         */
+        for (int i = 0; i < 20; i++) {
+            xmm_msg_t ind;
+            if (xmm_rpc_pump(rpc, &ind) < 0) break;
+            bool done = (ind.type == XMM_MSG_UNSOLICITED &&
+                         (ind.code == 0x04F || ind.code == 0x050));
+            xmm_msg_free(&ind);
+            if (done) {
+                rpc_log("disconnect: PDP context deactivated");
+                break;
+            }
+        }
+    } else {
+        rpc_log("disconnect: UtaMsCallPsDeactivateReq failed (ok if already deactivated)");
+    }
+
+    rpc_log("disconnect: RPC disconnect sequence complete");
+    return 0;   /* best-effort — always succeed */
+}
+
 int xmm_fcc_unlock(xmm_rpc_t *rpc) {
     xmm_msg_t resp;
 

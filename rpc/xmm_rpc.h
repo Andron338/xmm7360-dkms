@@ -102,6 +102,15 @@ int xmm_get_ip(xmm_rpc_t *rpc,
                char  dns_v4[][16], int *ndns_v4,
                char  dns_v6[][46], int *ndns_v6);
 
+/*
+ * Send the proper RPC disconnect sequence:
+ *   UtaRPCPSConnectReleaseReq  — release RPC data channel
+ *   UtaMsCallPsDeactivateReq   — deactivate PDP context (cause = 0)
+ * Pumps briefly for DeactivateRspCb / DeactivateIndCb confirmation.
+ * Always returns 0 — disconnect is best-effort; errors are logged.
+ */
+int xmm_rpc_disconnect(xmm_rpc_t *rpc);
+
 /* ── Pack functions ───────────────────────────────────────────────────────── */
 
 /*

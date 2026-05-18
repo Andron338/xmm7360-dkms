@@ -241,6 +241,54 @@ static int route_add_default(int nlfd, int ifidx, uint32_t gw_ne, uint32_t metri
 
 /* ── Public entry point ───────────────────────────────────────────────────── */
 
+int xmm_if_teardown(const char *ifname)
+{
+    int nlfd = nl_open();
+    if (nlfd < 0) return -1;
+
+    int ifidx = if_index(ifname);
+    if (ifidx < 0) { close(nlfd); return -1; }
+
+    /* Flush all addresses — reuses the same RTM_DELADDR loop as configure */
+    if_flush_addr(nlfd, ifidx);
+
+    /* Delete the default route for this interface */
+    struct {
+        struct nlmsghdr  nlh;
+        struct rtmsg     rtm;
+        char             buf[256];
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.nlh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nlh.nlmsg_type  = RTM_DELROUTE;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST;
+    req.rtm.rtm_family  = AF_INET;
+    req.rtm.rtm_table   = RT_TABLE_MAIN;
+    req.rtm.rtm_scope   = RT_SCOPE_UNIVERSE;
+    req.rtm.rtm_type    = RTN_UNICAST;
+    req.rtm.rtm_dst_len = 0; /* default route */
+    addattr(&req.nlh, (int)sizeof(req), RTA_OIF, &ifidx, sizeof(ifidx));
+    nl_talk(nlfd, &req.nlh);   /* ignore error — route may not exist */
+
+    /* Bring interface DOWN */
+    {
+        struct ifreq ifr;
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+            if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+                ifr.ifr_flags &= ~IFF_UP;
+                ioctl(s, SIOCSIFFLAGS, &ifr);
+            }
+            close(s);
+        }
+    }
+
+    close(nlfd);
+    return 0;
+}
+
 int xmm_if_configure(const char *ifname,
                      const char *ip_str,
                      int         metric,

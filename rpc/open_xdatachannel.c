@@ -41,6 +41,7 @@ typedef struct {
     int  no_resolv;
     int  use_nm;
     int  init_only;   /* --init-only: wake modem for ModemManager, then exit */
+    int  disconnect;  /* --disconnect: clean RPC teardown, then exit */
     char device[256];
 } cfg_t;
 
@@ -53,6 +54,7 @@ static void cfg_defaults(cfg_t *c) {
     c->use_nm           = 0;
     c->device[0]        = '\0';
     c->init_only        = 0;
+    c->disconnect       = 0;
 }
 
 /* Trim leading/trailing whitespace in-place, returns pointer into s */
@@ -101,6 +103,9 @@ static void usage(const char *prog) {
         "  -r, --noresolv               Do not write DNS to /etc/resolv.conf\n"
         "  -d, --dbus                   Activate connection via NetworkManager\n"
         "  -c, --conf <file>            Config file path\n"
+        "  -i, --init-only              Init modem for ModemManager (no data channel)\n"
+        "  -x, --disconnect             RPC teardown + interface down, then exit\n"
+        "  -D, --device <path>          RPC device path\n"
         "  -h, --help                   Show this help\n"
         "\n"
         "Config files (loaded in order, CLI overrides):\n"
@@ -143,12 +148,13 @@ int main(int argc, char *argv[]) {
         {"conf",             required_argument, NULL, 'c'},
         {"device",           required_argument, NULL, 'D'},
         {"init-only",        no_argument,       NULL, 'i'},
+        {"disconnect",       no_argument,       NULL, 'x'},
         {"help",             no_argument,       NULL, 'h'},
         {NULL, 0, NULL, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "a:nm:t:rdc:hD:i", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:nm:t:rdc:hD:ix", longopts, NULL)) != -1) {
         switch (opt) {
         case 'a': snprintf(cfg.apn, sizeof(cfg.apn), "%s", optarg); break;
         case 'n': cfg.no_default_route = 1; break;
@@ -159,12 +165,13 @@ int main(int argc, char *argv[]) {
         case 'c': load_ini(&cfg, optarg); break;
         case 'D': snprintf(cfg.device, sizeof(cfg.device), "%s", optarg); break;
         case 'i': cfg.init_only = 1; break;
+        case 'x': cfg.disconnect = 1; break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
 
-    if (cfg.apn[0] == '\0' && !cfg.init_only) {
+    if (cfg.apn[0] == '\0' && !cfg.init_only && !cfg.disconnect) {
         fprintf(stderr, "error: --apn is required (or use --init-only to just wake the modem)\n\n");
         usage(argv[0]);
         return 1;
@@ -255,6 +262,20 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "mode_set failed\n");
         xmm_rpc_close(&rpc);
         return 1;
+    }
+
+    /* ── disconnect: clean RPC teardown, then exit ─────────────────────────── */
+    if (cfg.disconnect) {
+        /* Tear down data channel via RPC so modem reaches
+         * "attached, no bearer" state. --init-only can then
+         * reinitialise without a full module reload. */
+        xmm_rpc_disconnect(&rpc);
+        xmm_if_teardown("wwan0");
+        fprintf(stderr,
+            "RPC disconnect complete.\n"
+            "Run open_xdatachannel --init-only to reinitialise.\n");
+        xmm_rpc_close(&rpc);
+        return 0;
     }
 
     /* ── init-only: wake modem for ModemManager, then exit ──────────────── */

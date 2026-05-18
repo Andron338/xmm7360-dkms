@@ -1,5 +1,5 @@
 [Unit]
-Description=XMM7360 Modem Recovery (module reload + reinit)
+Description=XMM7360 Modem Recovery (disconnect + reinit or module reload)
 
 [Service]
 Type=oneshot
@@ -10,6 +10,21 @@ ExecStart=/bin/sh -c '\
     \
     systemctl stop xmm7360-init.service 2>/dev/null || true; \
     rm -f /run/xmm7360-init.done; \
+    \
+    logger -t xmm7360-recovery "Attempting clean RPC disconnect"; \
+    if open_xdatachannel --disconnect 2>/dev/null; then \
+        logger -t xmm7360-recovery "RPC disconnect succeeded — reinitialising"; \
+        open_xdatachannel --init-only && { \
+            touch /run/xmm7360-init.done; \
+            logger -t xmm7360-recovery "Reinit succeeded — no module reload needed"; \
+            mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
+            logger -t xmm7360-recovery "Recovery complete (fast path)"; \
+            exit 0; \
+        }; \
+        logger -t xmm7360-recovery "Reinit failed — falling back to module reload"; \
+    else \
+        logger -t xmm7360-recovery "RPC disconnect failed — using module reload"; \
+    fi; \
     \
     logger -t xmm7360-recovery "Unloading module"; \
     if ! modprobe -r xmm7360 2>/dev/null; then \
@@ -23,8 +38,6 @@ ExecStart=/bin/sh -c '\
     \
     logger -t xmm7360-recovery "Loading module"; \
     modprobe xmm7360; \
-    \
-    logger -t xmm7360-recovery "Waiting for devices"; \
     udevadm settle; \
     \
     logger -t xmm7360-recovery "Starting RPC init"; \
@@ -33,13 +46,12 @@ ExecStart=/bin/sh -c '\
     logger -t xmm7360-recovery "Restarting ModemManager"; \
     systemctl restart ModemManager; \
     \
-    logger -t xmm7360-recovery "Waiting for modem to register with MM"; \
     for i in $(seq 1 30); do \
         mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
         sleep 1; \
     done; \
     \
-    logger -t xmm7360-recovery "Recovery complete"'
+    logger -t xmm7360-recovery "Recovery complete (module reload path)"'
 
 StandardOutput=journal
 StandardError=journal

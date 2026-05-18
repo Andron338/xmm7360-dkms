@@ -12,6 +12,13 @@
 #include <stdint.h>
 
 /*
+ * Tear down the interface: flush addresses, remove routes, bring DOWN.
+ * Call this on disconnect before re-running configure on reconnect.
+ * Returns 0 on success, -1 on error.
+ */
+int xmm_if_teardown(const char *ifname);
+
+/*
  * Bring interface up, flush addresses, add /32 addr and default route.
  *
  * ifname      : e.g. "wwan0"
