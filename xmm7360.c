@@ -1564,58 +1564,56 @@ static int xmm7360_suspend(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
-	/* Stop the network device — no more TX while suspended */
 	if (xmm->netdev) {
 		netif_stop_queue(xmm->netdev);
 		netif_device_detach(xmm->netdev);
 	}
-
-	/* Cancel the MUX coalescing timer */
 	if (xmm->net)
 		hrtimer_cancel(&xmm->net->deadline);
-
-	/* Flush any queued init work */
 	cancel_work_sync(&xmm->init_work);
 
 	dev_info(dev, "xmm7360: suspended\n");
 	return 0;
 }
 
+/*
+ * Normal suspend/resume: hardware stayed in D3, DMA coherent memory is
+ * still valid. Just re-attach the netdev so the network stack can use it
+ * again. Userspace (xmm7360-resume.service → xmm7360-recovery.service)
+ * handles the full modem reinit via module reload.
+ */
 static int xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
-	int ret;
 
-	dev_info(dev, "xmm7360: resuming\n");
-
-	/*
-	 * The modem firmware loses all state on power-down.
-	 * Tear down and rebuild every DMA ring and device so the
-	 * hardware sees a clean slate — same path as initial probe.
-	 */
-	xmm7360_dev_deinit(xmm);
-
-	ret = xmm7360_dev_init(xmm);
-	if (ret) {
-		dev_err(dev, "xmm7360: resume reinit failed: %d\n", ret);
-		return ret;
-	}
-
-	/*
-	 * Signal userspace that the modem hardware is back.
-	 * The udev rule on ttyXMM1 will restart xmm7360-init.service
-	 * which re-runs open_xdatachannel --init-only over the RPC channel.
-	 */
 	if (xmm->netdev)
 		netif_device_attach(xmm->netdev);
 
-	dev_info(dev, "xmm7360: resume complete\n");
+	dev_info(dev, "xmm7360: resumed\n");
+	return 0;
+}
+
+/*
+ * Hibernation restore: after loading state from disk the DMA coherent
+ * memory physical addresses are stale — attempting to reprogram hardware
+ * with them causes a kernel panic. Return 0 and let userspace reload the
+ * module cleanly via xmm7360-recovery.service.
+ */
+static int xmm7360_restore(struct device *dev)
+{
+	dev_info(dev, "xmm7360: hibernation restore — userspace will reload module\n");
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
 
-static SIMPLE_DEV_PM_OPS(xmm7360_pm_ops, xmm7360_suspend, xmm7360_resume);
+static const struct dev_pm_ops xmm7360_pm_ops = {
+	.suspend  = xmm7360_suspend,
+	.resume   = xmm7360_resume,
+	.freeze   = xmm7360_suspend,   /* hibernate pre-save  */
+	.thaw     = xmm7360_resume,    /* hibernate cancelled */
+	.restore  = xmm7360_restore,   /* hibernate post-load: no-op */
+};
 
 static struct pci_driver xmm7360_driver = {
 	.name     = "xmm7360",
