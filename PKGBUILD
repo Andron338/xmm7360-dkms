@@ -6,7 +6,7 @@ pkgver=r1.g0000000   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
-url="https://github.com/YOUR_USERNAME/xmm7360-pci"
+url="https://github.com/Andron338/xmm7360-pci"
 license=('GPL2')
 
 depends=(
