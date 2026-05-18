@@ -2,7 +2,7 @@
 # AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
 pkgname=xmm7360-dkms-git
-pkgver=r272.gdf04e1e   # updated by pkgver() below
+pkgver=r1.g0000000   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
@@ -84,10 +84,6 @@ package() {
     # ── suspend/resume sleep hook (pre-suspend only) ───────────────────
     install -Dm755 "$_src/xmm7360-sleep" \
         "${pkgdir}/usr/lib/systemd/system-sleep/xmm7360"
-
-    # ── post-resume service (proper ordering after MM) ───────────────────
-    install -Dm644 "$_src/xmm7360-resume.service" \
-        "${pkgdir}/usr/lib/systemd/system/xmm7360-resume.service"
 
 
     # ── modprobe config (blacklist iosm) ─────────────────────────────────

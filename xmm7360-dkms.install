@@ -21,7 +21,6 @@ post_install() {
     echo ">>> Enabling xmm7360-init.service..."
     systemctl daemon-reload
     systemctl enable xmm7360-init.service
-    systemctl enable xmm7360-resume.service
     systemctl enable --now xmm7360-watch.service
 
     echo ""
@@ -49,7 +48,6 @@ pre_remove() {
     local ver
     ver=$(ls /usr/src | grep "^${_pkgname}-" | sort -V | tail -1 | sed "s/${_pkgname}-//")
 
-    systemctl disable xmm7360-resume.service 2>/dev/null || true
     systemctl disable xmm7360-watch.service 2>/dev/null || true
     systemctl stop    xmm7360-watch.service 2>/dev/null || true
 
