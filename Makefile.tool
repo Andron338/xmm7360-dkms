@@ -10,6 +10,7 @@ LDFLAGS :=
 
 PREFIX  ?= /usr
 BINDIR  := $(PREFIX)/bin
+MANDIR  := $(PREFIX)/share/man/man8
 
 NM_CFLAGS  := $(shell pkg-config --cflags libnm 2>/dev/null)
 NM_LIBS    := $(shell pkg-config --libs   libnm 2>/dev/null)
@@ -27,36 +28,27 @@ SRCS := \
 
 OBJS := $(SRCS:.c=.o)
 BIN  := open_xdatachannel
-WATCH := xmm7360-watch
-GIO_CFLAGS := $(shell pkg-config --cflags gio-2.0 2>/dev/null)
-GIO_LIBS   := $(shell pkg-config --libs   gio-2.0 2>/dev/null)
 
 .PHONY: all clean install uninstall
 
-all: $(BIN) $(WATCH)
+all: $(BIN)
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-$(WATCH): xmm7360-watch.c
-	$(CC) $(CFLAGS) $(GIO_CFLAGS) -o $@ $< $(GIO_LIBS)
-
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-MANDIR  := $(PREFIX)/share/man/man8
-
-install: $(BIN) $(WATCH)
-	install -Dm755 $(BIN)   $(DESTDIR)$(BINDIR)/$(BIN)
-	install -Dm755 $(WATCH) $(DESTDIR)$(BINDIR)/$(WATCH)
+install: $(BIN)
+	install -Dm755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
 	install -Dm644 ../open_xdatachannel.8 $(DESTDIR)$(MANDIR)/open_xdatachannel.8
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
-	rm -f $(DESTDIR)$(BINDIR)/$(WATCH)
+	rm -f $(DESTDIR)$(MANDIR)/open_xdatachannel.8
 
 clean:
-	rm -f $(OBJS) $(BIN) $(WATCH)
+	rm -f $(OBJS) $(BIN)
 
 # Header dependencies
 open_xdatachannel.o: open_xdatachannel.c xmm_rpc.h xmm_rpc_ids.h xmm_netlink.h xmm_nm.h xmm_proto.h

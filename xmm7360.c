@@ -48,6 +48,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/kobject.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
 #include <linux/poll.h>
@@ -290,6 +291,22 @@ struct xmm_net {
 	spinlock_t lock;
 	struct mux_frame frame;
 };
+
+/*
+ * Emit a uevent on the underlying PCI device so udev can trigger a
+ * userspace service (modprobe reload, init re-run) without us needing
+ * a long-running watch daemon.
+ */
+static void xmm7360_emit_uevent(struct xmm_dev *xmm, const char *state)
+{
+	char buf[64];
+	char *env[] = { buf, NULL };
+	struct pci_dev *pdev = to_pci_dev(xmm->dev);
+
+	snprintf(buf, sizeof(buf), "XMM7360_STATE=%s", state);
+	kobject_uevent_env(&pdev->dev.kobj, KOBJ_CHANGE, env);
+	dev_info(xmm->dev, "uevent: %s\n", buf);
+}
 
 static void xmm7360_poll(struct xmm_dev *xmm)
 {
@@ -1691,8 +1708,9 @@ static void xmm7360_recovery_work(struct work_struct *work)
 
 	if (xmm->recovery_count >= 3) {
 		dev_err(xmm->dev,
-			"3 kernel recoveries in 5 min — giving up, "
-			"userspace must reload the module\n");
+			"3 kernel recoveries in 5 min — emitting uevent for "
+			"userspace module reload\n");
+		xmm7360_emit_uevent(xmm, "failed");
 		return;
 	}
 
@@ -1734,6 +1752,7 @@ static void xmm7360_recovery_work(struct work_struct *work)
 		/* Re-enable IRQ so future remove() can run cleanly */
 		if (xmm->irq)
 			enable_irq(xmm->irq);
+		xmm7360_emit_uevent(xmm, "failed");
 		return;
 	}
 
@@ -1857,6 +1876,7 @@ static int xmm7360_resume(struct device *dev)
 		netif_device_attach(xmm->netdev);
 
 	dev_info(dev, "xmm7360: resumed\n");
+	xmm7360_emit_uevent(xmm, "resumed");
 	return 0;
 }
 

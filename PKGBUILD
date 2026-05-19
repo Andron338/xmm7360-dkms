@@ -1,8 +1,8 @@
-# Maintainer: Your Name <you@example.com>
+# Maintainer: Andron <andron@andron-thinkpad>
 # AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
 pkgname=xmm7360-dkms-git
-pkgver=r281.ge88e499   # updated by pkgver() below
+pkgver=r1.g0000000   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
@@ -16,7 +16,6 @@ depends=(
     'util-linux-libs'
     'networkmanager'
     'modemmanager'
-    'glib2'
 )
 makedepends=('linux-headers' 'git')
 optdepends=('linux-headers: required by DKMS on kernel update')
@@ -63,28 +62,17 @@ package() {
     install -Dm644 "$_src/open_xdatachannel.8" \
         "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
 
-    # ── udev rules ───────────────────────────────────────────────────────
+    # ── udev rules (also catches kernel-emitted XMM7360_STATE uevents) ───
     install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
-    # ── systemd service ──────────────────────────────────────────────────
+    # ── Boot-time RPC init (triggered by udev when ttyXMM1 appears) ──────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
 
-    # ── watch daemon (D-Bus state monitor, replaces NM dispatcher) ───────
-    install -Dm755 "$_src/rpc/xmm7360-watch" \
-        "${pkgdir}/usr/bin/xmm7360-watch"
-    install -Dm644 "$_src/xmm7360-watch.service" \
-        "${pkgdir}/usr/lib/systemd/system/xmm7360-watch.service"
-
-    # ── recovery service (disconnect + suspend) ─────────────────────────
+    # ── Last-resort module reload (triggered by kernel uevent) ───────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
-
-    # ── suspend/resume sleep hook (pre-suspend only) ───────────────────
-    install -Dm755 "$_src/xmm7360-sleep" \
-        "${pkgdir}/usr/lib/systemd/system-sleep/xmm7360"
-
 
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
     install -Dm644 "$_src/xmm7360-modprobe.conf" \
