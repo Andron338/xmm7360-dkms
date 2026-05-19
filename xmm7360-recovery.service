@@ -1,9 +1,11 @@
 [Unit]
-Description=XMM7360 Modem Recovery (with retries + exponential backoff)
+Description=XMM7360 Modem Recovery (D-Bus first, module reload fallback)
 
 [Service]
 Type=oneshot
 RemainAfterExit=no
+TimeoutStartSec=120
+TimeoutStopSec=10
 
 ExecStart=/bin/sh -c '\
     attempt=1; \
@@ -11,50 +13,71 @@ ExecStart=/bin/sh -c '\
     while [ $attempt -le $max_attempts ]; do \
         logger -t xmm7360-recovery "Recovery attempt $attempt/$max_attempts"; \
         \
+        # ── PRIMARY: cycle the modem through MM via D-Bus ─────────────── \
+        # mmcli is a D-Bus client. MM drives AT commands over ttyXMM, \
+        # which is far more reliable than our own RPC channel which may \
+        # itself be the thing thats wedged. \
+        logger -t xmm7360-recovery "D-Bus path: disabling modem via MM"; \
+        if timeout 15 mmcli -m 0 --disable 2>/dev/null; then \
+            logger -t xmm7360-recovery "D-Bus path: enabling modem via MM"; \
+            if timeout 30 mmcli -m 0 --enable 2>/dev/null; then \
+                # Wait for modem to register (up to 30s) \
+                for i in $(seq 1 30); do \
+                    state=$(mmcli -m 0 2>/dev/null | grep "state:" | head -1); \
+                    case "$state" in \
+                        *registered*|*connected*|*enabled*) \
+                            mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
+                            logger -t xmm7360-recovery "Recovery complete via D-Bus (attempt $attempt)"; \
+                            exit 0;; \
+                    esac; \
+                    sleep 1; \
+                done; \
+                logger -t xmm7360-recovery "D-Bus path: modem did not register"; \
+            else \
+                logger -t xmm7360-recovery "D-Bus path: --enable failed/timeout"; \
+            fi; \
+        else \
+            logger -t xmm7360-recovery "D-Bus path: --disable failed/timeout (MM unresponsive?)"; \
+        fi; \
+        \
+        # ── FALLBACK: module reload ───────────────────────────────────── \
+        logger -t xmm7360-recovery "Fallback: module reload"; \
         systemctl stop xmm7360-init.service 2>/dev/null || true; \
         rm -f /run/xmm7360-init.done; \
         \
-        # Fast path: clean RPC disconnect + reinit (no module reload) \
-        logger -t xmm7360-recovery "Trying clean RPC disconnect"; \
-        if open_xdatachannel --disconnect 2>/dev/null; then \
-            . /etc/xmm7360.conf 2>/dev/null || true; \
-            if open_xdatachannel --apn ${XMM_APN:-internet} --metric ${XMM_METRIC:-1000} 2>/dev/null; then \
-                touch /run/xmm7360-init.done; \
-                mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
-                logger -t xmm7360-recovery "Recovery complete (fast path, attempt $attempt)"; \
-                exit 0; \
-            fi; \
+        if ! timeout 5 modprobe -r xmm7360 2>/dev/null; then \
+            systemctl stop ModemManager; \
+            timeout 10 modprobe -r xmm7360 || { \
+                logger -t xmm7360-recovery "ERROR: cannot unload module"; \
+                continue; \
+            }; \
         fi; \
         \
-        # Slow path: full module reload \
-        logger -t xmm7360-recovery "Falling back to module reload"; \
-        if modprobe -r xmm7360 2>/dev/null || { systemctl stop ModemManager; modprobe -r xmm7360; }; then \
-            modprobe xmm7360; \
-            udevadm settle; \
-            systemctl start xmm7360-init.service 2>/dev/null || true; \
-            systemctl restart ModemManager; \
-            for i in $(seq 1 30); do \
-                mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
-                sleep 1; \
-            done; \
-            \
-            # Verify modem actually came back \
-            if mmcli -m 0 2>/dev/null | grep -q "state:.*registered\\|state:.*connected\\|state:.*enabled"; then \
-                logger -t xmm7360-recovery "Recovery complete (module reload, attempt $attempt)"; \
-                exit 0; \
-            fi; \
+        timeout 10 modprobe xmm7360; \
+        udevadm settle; \
+        systemctl start xmm7360-init.service 2>/dev/null || true; \
+        systemctl restart ModemManager; \
+        \
+        for i in $(seq 1 30); do \
+            mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
+            sleep 1; \
+        done; \
+        \
+        if mmcli -m 0 2>/dev/null | grep -qE "state:.*(registered|connected|enabled)"; then \
+            logger -t xmm7360-recovery "Recovery complete via module reload (attempt $attempt)"; \
+            exit 0; \
         fi; \
         \
-        # Failed — back off and retry \
+        # ── Exponential backoff before next retry ─────────────────────── \
         if [ $attempt -lt $max_attempts ]; then \
-            delay=$((5 * (1 << (attempt - 1)))); \
-            logger -t xmm7360-recovery "Attempt $attempt failed; backing off ${delay}s"; \
+            delay=$((5 * attempt)); \
+            logger -t xmm7360-recovery "Attempt $attempt failed; backoff ${delay}s"; \
             sleep $delay; \
         fi; \
         attempt=$((attempt + 1)); \
     done; \
     \
-    logger -t xmm7360-recovery "ERROR: all $max_attempts recovery attempts failed"; \
+    logger -t xmm7360-recovery "ERROR: all $max_attempts attempts failed"; \
     exit 1'
 
 StandardOutput=journal

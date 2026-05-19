@@ -295,11 +295,15 @@ static void xmm7360_poll(struct xmm_dev *xmm)
 {
 	bool was_ok = !xmm->error;
 
+	/* cp may be NULL during recovery_work (dev_deinit freed it) */
+	if (!xmm->cp)
+		return;
+
 	if (xmm->cp->status.code == 0xbadc0ded) {
 		dev_err(xmm->dev, "crashed but dma up\n");
 		xmm->error = -ENODEV;
 	}
-	if (xmm->bar2[BAR2_STATUS] != 0x600df00d) {
+	if (xmm->bar2 && xmm->bar2[BAR2_STATUS] != 0x600df00d) {
 		dev_err(xmm->dev, "bad status %x\n", xmm->bar2[BAR2_STATUS]);
 		xmm->error = -ENODEV;
 	}
@@ -1234,8 +1238,13 @@ static irqreturn_t xmm7360_irq0(int irq, void *dev_id)
 
 	xmm7360_poll(xmm);
 	wake_up(&xmm->wq);
-	if (xmm->td_ring) {
-		xmm7360_net_poll(xmm);
+	/* Skip per-queue-pair work if recovery is in progress.
+	 * xmm->cp is the canonical "we have a working device" sentinel —
+	 * it is NULL after cmd_ring_free() and set again by cmd_ring_init().
+	 * The old `if (xmm->td_ring)` check was always true (array address). */
+	if (xmm->cp && !xmm->error) {
+		if (xmm->net)
+			xmm7360_net_poll(xmm);
 
 		for (id = 1; id < 8; id++) {
 			qp = &xmm->qp[id];
@@ -1693,6 +1702,19 @@ static void xmm7360_recovery_work(struct work_struct *work)
 	dev_info(xmm->dev, "kernel-level recovery (attempt %d/3)\n",
 		 xmm->recovery_count);
 
+	/* CRITICAL: silence the IRQ source so the handler does not race
+	 * with dev_deinit freeing cp/td_ring/qp/netdev. disable_irq() blocks
+	 * until any in-flight IRQ completes, then masks the line. */
+	if (xmm->irq)
+		disable_irq(xmm->irq);
+
+	/* Stop the watchdog so it does not fire on half-built state */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	timer_delete_sync(&xmm->watchdog);
+#else
+	del_timer_sync(&xmm->watchdog);
+#endif
+
 	/* Tear down everything (netdev, ttys, cdevs, DMA rings) */
 	xmm7360_dev_deinit(xmm);
 
@@ -1702,17 +1724,23 @@ static void xmm7360_recovery_work(struct work_struct *work)
 	/* Clear error so dev_init can proceed */
 	xmm->error = 0;
 
-	/* Re-handshake with firmware and recreate all interfaces.
-	 * If the firmware is wedged, CMD_WAKEUP will time out and ret < 0;
-	 * userspace recovery will then unload + reload the module. */
+	/* Re-handshake with firmware and recreate all interfaces */
 	ret = xmm7360_dev_init(xmm);
 	if (ret < 0) {
 		dev_err(xmm->dev,
 			"kernel recovery dev_init failed (%d) — module reload needed\n",
 			ret);
 		xmm->error = -ENODEV;
+		/* Re-enable IRQ so future remove() can run cleanly */
+		if (xmm->irq)
+			enable_irq(xmm->irq);
 		return;
 	}
+
+	/* Re-enable IRQ and re-arm watchdog before returning to normal ops */
+	if (xmm->irq)
+		enable_irq(xmm->irq);
+	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
 
 	dev_info(xmm->dev, "kernel-level recovery complete\n");
 }

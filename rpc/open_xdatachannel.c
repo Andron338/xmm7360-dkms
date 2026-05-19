@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
 #include <unistd.h>
 
 #include "xmm_rpc.h"
@@ -177,11 +178,27 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* ── Disconnect mode: arm a hard kill-switch BEFORE touching the device.
+     * If the modem RPC channel is wedged, the open() syscall itself can
+     * block indefinitely in the kernel. The default SIGALRM action is to
+     * terminate the process — exactly what we want so the recovery service
+     * can fall through to the module reload path. */
+    if (cfg.disconnect) {
+        signal(SIGALRM, SIG_DFL);
+        alarm(5);
+    }
+
     /* ── Step 1: Open modem RPC interface ─────────────────────────────────── */
-    /* Retry for up to 5 seconds — the RPC device may appear slightly after
-     * ttyXMM1 which is what udev/systemd waits on. */
     xmm_rpc_t rpc;
-    {
+    if (cfg.disconnect) {
+        /* Single attempt with no retry — disconnect must finish fast or fail */
+        if (xmm_rpc_open(&rpc, cfg.device[0] ? cfg.device : NULL) < 0) {
+            fprintf(stderr, "disconnect: cannot open RPC device\n");
+            return 1;
+        }
+    } else {
+        /* Retry for up to 5 seconds — the RPC device may appear slightly
+         * after ttyXMM1 which is what udev/systemd waits on. */
         int _opened = 0;
         for (int _i = 0; _i < 10; _i++) {
             if (xmm_rpc_open(&rpc, cfg.device[0] ? cfg.device : NULL) == 0) {
@@ -266,14 +283,11 @@ int main(int argc, char *argv[]) {
 
     /* ── disconnect: clean RPC teardown, then exit ─────────────────────────── */
     if (cfg.disconnect) {
-        /* Tear down data channel via RPC so modem reaches
-         * "attached, no bearer" state. --init-only can then
-         * reinitialise without a full module reload. */
+        /* alarm(5) already armed above before the device open */
         xmm_rpc_disconnect(&rpc);
+        alarm(0);
         xmm_if_teardown("wwan0");
-        fprintf(stderr,
-            "RPC disconnect complete.\n"
-            "Run open_xdatachannel --init-only to reinitialise.\n");
+        fprintf(stderr, "RPC disconnect complete.\n");
         xmm_rpc_close(&rpc);
         return 0;
     }
