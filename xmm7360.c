@@ -219,6 +219,11 @@ struct xmm_dev {
 
 	struct work_struct init_work;
 
+	/* Kernel-level error recovery (option 4) */
+	struct work_struct recovery_work;
+	unsigned long      last_recovery_jiffies;
+	int                recovery_count;
+
 	volatile struct control_page *cp;
 	dma_addr_t cp_phys;
 
@@ -282,6 +287,8 @@ struct xmm_net {
 
 static void xmm7360_poll(struct xmm_dev *xmm)
 {
+	bool was_ok = !xmm->error;
+
 	if (xmm->cp->status.code == 0xbadc0ded) {
 		dev_err(xmm->dev, "crashed but dma up\n");
 		xmm->error = -ENODEV;
@@ -290,6 +297,10 @@ static void xmm7360_poll(struct xmm_dev *xmm)
 		dev_err(xmm->dev, "bad status %x\n", xmm->bar2[BAR2_STATUS]);
 		xmm->error = -ENODEV;
 	}
+
+	/* On transition OK -> error, schedule kernel-level recovery */
+	if (was_ok && xmm->error)
+		schedule_work(&xmm->recovery_work);
 }
 
 static void xmm7360_ding(struct xmm_dev *xmm, int bell)
@@ -652,6 +663,8 @@ static void xmm7360_tty_poll_qp(struct queue_pair *qp)
 		ring->last_handled = (idx + 1) & (ring->depth - 1);
 	}
 }
+
+
 
 int xmm7360_cdev_open(struct inode *inode, struct file *file)
 {
@@ -1115,33 +1128,43 @@ static const struct net_device_ops xmm7360_netdev_ops = {
 	.ndo_start_xmit = xmm7360_net_xmit,
 };
 
-static void xmm7360_net_setup(struct net_device *dev)
+/*
+ * xmm7360_net_init_priv - initialise xmm_net private data embedded in netdev.
+ */
+static void xmm7360_net_init_priv(struct net_device *dev)
 {
 	struct xmm_net *xn = netdev_priv(dev);
 	spin_lock_init(&xn->lock);
-	/* Fix: hrtimer_setup() requires non-NULL callback on kernel >= 6.15 */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
 	hrtimer_init(&xn->deadline, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	xn->deadline.function = xmm7360_net_deadline_cb;
 #else
-	hrtimer_setup(&xn->deadline, xmm7360_net_deadline_cb, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	hrtimer_setup(&xn->deadline, xmm7360_net_deadline_cb,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 #endif
 	skb_queue_head_init(&xn->queue);
-
-	dev->netdev_ops = &xmm7360_netdev_ops;
-
-	dev->hard_header_len = 0;
-	dev->addr_len = 0;
-	dev->mtu = 1500;
-	dev->min_mtu = 1500;
-	dev->max_mtu = 1500;
-
-	dev->tx_queue_len = 1000;
-
-	dev->type = ARPHRD_NONE;
-	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
 }
 
+static void xmm7360_net_setup(struct net_device *dev)
+{
+	dev->netdev_ops      = &xmm7360_netdev_ops;
+	dev->hard_header_len = 0;
+	dev->addr_len        = 0;
+	dev->mtu             = 1500;
+	dev->min_mtu         = 1500;
+	dev->max_mtu         = 1500;
+	dev->tx_queue_len    = 1000;
+	dev->type            = ARPHRD_NONE;
+	dev->flags           = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
+}
+
+/*
+ * Plain alloc_netdev path — wwan0 is a regular netdev parented to the PCI
+ * device. ModemManager uses the Fibocom plugin (via ttyXMM* tags) for AT
+ * commands and signal reporting; the data channel is managed entirely by
+ * open_xdatachannel from userspace, just like iosm. NetworkManager keeps
+ * wwan0 unmanaged (see NM conf.d).
+ */
 static int xmm7360_create_net(struct xmm_dev *xmm)
 {
 	struct net_device *netdev;
@@ -1150,14 +1173,13 @@ static int xmm7360_create_net(struct xmm_dev *xmm)
 
 	netdev = alloc_netdev(sizeof(struct xmm_net), "wwan%d",
 			      NET_NAME_UNKNOWN, xmm7360_net_setup);
-
 	if (!netdev)
 		return -ENOMEM;
 
+	xmm7360_net_init_priv(netdev);
 	SET_NETDEV_DEV(netdev, xmm->dev);
 
 	xmm->netdev = netdev;
-
 	xn = netdev_priv(netdev);
 	xn->xmm = xmm;
 	xmm->net = xn;
@@ -1167,14 +1189,13 @@ static int xmm7360_create_net(struct xmm_dev *xmm)
 	rtnl_unlock();
 
 	xn->qp = xmm7360_init_qp(xmm, 0, 128, TD_MAX_PAGE_SIZE);
-
 	if (!ret)
 		ret = xmm7360_qp_start(xn->qp);
 
 	if (ret < 0) {
 		free_netdev(netdev);
-		xmm->netdev = NULL;
 		xmm7360_qp_stop(xn->qp);
+		xmm->netdev = NULL;
 	}
 
 	return ret;
@@ -1188,7 +1209,7 @@ static void xmm7360_destroy_net(struct xmm_dev *xmm)
 		unregister_netdevice(xmm->netdev);
 		rtnl_unlock();
 		free_netdev(xmm->netdev);
-		xmm->net = NULL;
+		xmm->net    = NULL;
 		xmm->netdev = NULL;
 	}
 }
@@ -1262,6 +1283,9 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 static void xmm7360_remove(struct pci_dev *dev)
 {
 	struct xmm_dev *xmm = pci_get_drvdata(dev);
+
+	/* Cancel pending kernel recovery before tearing down */
+	cancel_work_sync(&xmm->recovery_work);
 
 	xmm7360_dev_deinit(xmm);
 
@@ -1366,23 +1390,86 @@ static int xmm7360_tty_port_activate(struct tty_port *tport,
 	return xmm7360_qp_start(qp);
 }
 
+/*
+ * Use container_of() — tport->tty may be NULL when shutdown is reached
+ * via tty_port_hangup() (pppd hangup path). Dereferencing it crashes.
+ */
 static void xmm7360_tty_port_shutdown(struct tty_port *tport)
 {
-	struct queue_pair *qp = tport->tty->driver_data;
+	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
 	xmm7360_qp_stop(qp);
+	qp->tty_needs_wake = 0;
+}
+
+/*
+ * DTR/RTS toggle from pppd. We have no real modem control lines, but
+ * pppd uses DTR drop to signal hangup. Treat clearing both lines as a
+ * hint to stop the queue pair so the modem sees a fresh state on reopen.
+ */
+static void xmm7360_tty_port_dtr_rts(struct tty_port *tport, int raise)
+{
+	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
+	if (!raise && qp->open)
+		xmm7360_qp_stop(qp);
 }
 
 static const struct tty_port_operations xmm7360_tty_port_ops = {
 	.activate = xmm7360_tty_port_activate,
 	.shutdown = xmm7360_tty_port_shutdown,
+	.dtr_rts  = xmm7360_tty_port_dtr_rts,
 };
 
+/*
+ * Hangup handler — invoked when pppd drops DTR and the TTY layer
+ * decides the connection is lost, or when SIGHUP is delivered to a
+ * process holding the port. Delegate to tty_port_hangup() which
+ * calls our shutdown op to stop the queue pair.
+ */
+static void xmm7360_tty_hangup(struct tty_struct *tty)
+{
+	struct queue_pair *qp = tty->driver_data;
+	if (qp)
+		tty_port_hangup(&qp->port);
+}
+
+/*
+ * flush_buffer — pppd calls this during teardown. We have no internal
+ * write buffer (writes go straight to the DMA ring) so just clear the
+ * wake flag and let any sleepers proceed.
+ */
+static void xmm7360_tty_flush_buffer(struct tty_struct *tty)
+{
+	struct queue_pair *qp = tty->driver_data;
+	if (!qp)
+		return;
+	qp->tty_needs_wake = 0;
+	tty_wakeup(tty);
+}
+
+/*
+ * set_termios — pppd configures baud rate, character size, parity.
+ * We are not a real UART so we accept everything silently. Without
+ * this op the TTY layer warns about unsupported settings.
+ */
+static void xmm7360_tty_set_termios(struct tty_struct *tty,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,1,0)
+				    const struct ktermios *old)
+#else
+				    struct ktermios *old)
+#endif
+{
+	/* no-op: we are not a serial port */
+}
+
 static const struct tty_operations xmm7360_tty_ops = {
-	.open = xmm7360_tty_open,
-	.close = xmm7360_tty_close,
-	.write = xmm7360_tty_write,
-	.write_room = xmm7360_tty_write_room,
-	.install = xmm7360_tty_install,
+	.open         = xmm7360_tty_open,
+	.close        = xmm7360_tty_close,
+	.write        = xmm7360_tty_write,
+	.write_room   = xmm7360_tty_write_room,
+	.install      = xmm7360_tty_install,
+	.hangup       = xmm7360_tty_hangup,
+	.flush_buffer = xmm7360_tty_flush_buffer,
+	.set_termios  = xmm7360_tty_set_termios,
 };
 
 static int xmm7360_create_tty(struct xmm_dev *xmm, int num)
@@ -1406,6 +1493,8 @@ static int xmm7360_create_tty(struct xmm_dev *xmm, int num)
 
 	return 0;
 }
+
+
 
 static int xmm7360_create_cdev(struct xmm_dev *xmm, int num, const char *name,
 			       int cardnum)
@@ -1483,6 +1572,71 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 	return 0;
 }
 
+/*
+ * Kernel-level error recovery.
+ *
+ * Triggered by xmm7360_poll() when the modem reports the 0xbadc0ded
+ * crash sentinel or the BAR2 status word goes wrong.  Tears down the
+ * device, gives DMA a moment to settle, then reinitialises in place
+ * without unloading the module.
+ *
+ * Rate-limited: at most 3 recoveries in 5 minutes.  Beyond that, we
+ * give up and leave xmm->error set so userspace (xmm7360-watch +
+ * xmm7360-recovery.service) handles it via module reload.
+ */
+static void xmm7360_recovery_work(struct work_struct *work)
+{
+	struct xmm_dev *xmm = container_of(work, struct xmm_dev, recovery_work);
+	int ret;
+
+	/* Reset attempt counter if last recovery was long ago */
+	if (time_after(jiffies, xmm->last_recovery_jiffies + 5 * 60 * HZ))
+		xmm->recovery_count = 0;
+
+	/* Rate limit: never recover more than once per 10 seconds */
+	if (xmm->recovery_count > 0 &&
+	    time_before(jiffies, xmm->last_recovery_jiffies + 10 * HZ)) {
+		dev_warn(xmm->dev, "kernel recovery requested too soon — skipping\n");
+		return;
+	}
+
+	if (xmm->recovery_count >= 3) {
+		dev_err(xmm->dev,
+			"3 kernel recoveries in 5 min — giving up, "
+			"userspace must reload the module\n");
+		return;
+	}
+
+	xmm->recovery_count++;
+	xmm->last_recovery_jiffies = jiffies;
+
+	dev_info(xmm->dev, "kernel-level recovery (attempt %d/3)\n",
+		 xmm->recovery_count);
+
+	/* Tear down everything (netdev, ttys, cdevs, DMA rings) */
+	xmm7360_dev_deinit(xmm);
+
+	/* Give the modem firmware a moment to settle after DMA stop */
+	msleep(100);
+
+	/* Clear error so dev_init can proceed */
+	xmm->error = 0;
+
+	/* Re-handshake with firmware and recreate all interfaces.
+	 * If the firmware is wedged, CMD_WAKEUP will time out and ret < 0;
+	 * userspace recovery will then unload + reload the module. */
+	ret = xmm7360_dev_init(xmm);
+	if (ret < 0) {
+		dev_err(xmm->dev,
+			"kernel recovery dev_init failed (%d) — module reload needed\n",
+			ret);
+		xmm->error = -ENODEV;
+		return;
+	}
+
+	dev_info(xmm->dev, "kernel-level recovery complete\n");
+}
+
 void xmm7360_dev_init_work(struct work_struct *work)
 {
 	struct xmm_dev *xmm = container_of(work, struct xmm_dev, init_work);
@@ -1538,6 +1692,8 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 	init_waitqueue_head(&xmm->wq);
 	INIT_WORK(&xmm->init_work, xmm7360_dev_init_work);
+	INIT_WORK(&xmm->recovery_work, xmm7360_recovery_work);
+	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
 
 	xmm->irq = pci_irq_vector(dev, 0);
 	ret = request_irq(xmm->irq, xmm7360_irq0, 0, "xmm7360", xmm);
@@ -1645,7 +1801,7 @@ static int xmm7360_init(void)
 	xmm7360_tty_driver->subtype = SERIAL_TYPE_NORMAL;
 	xmm7360_tty_driver->flags =
 		TTY_DRIVER_REAL_RAW |
-		TTY_DRIVER_DYNAMIC_DEV; // Could this flags be defined in the flags??
+		TTY_DRIVER_DYNAMIC_DEV;
 	xmm7360_tty_driver->init_termios = tty_std_termios;
 	xmm7360_tty_driver->init_termios.c_cflag = B115200 | CS8 | CREAD |
 						   HUPCL | CLOCAL;
