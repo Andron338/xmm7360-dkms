@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         kernel: [linux, linux-lts, linux-zen, linux-rt, linux-hardened]
-        gcc: [gcc, gcc16]
+        gcc: [gcc, clang]
 
     container:
       image: archlinux:latest
@@ -44,8 +44,7 @@ jobs:
       # ─────────────────────────────
       - name: Install kernel + compiler
         run: |
-          pacman -S --noconfirm $GCC_PKG $KERNEL $KERNEL-headers \
-          gcc13
+          pacman -S --noconfirm $GCC_PKG $KERNEL $KERNEL-headers clang
 
       # ─────────────────────────────
       # 4. Create non-root build user (required by makepkg)
