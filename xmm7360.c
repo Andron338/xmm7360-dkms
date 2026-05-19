@@ -224,6 +224,12 @@ struct xmm_dev {
 	unsigned long      last_recovery_jiffies;
 	int                recovery_count;
 
+	/* Data-flow watchdog (option 2) */
+	struct timer_list  watchdog;
+	unsigned long      wd_last_tx_bytes;
+	unsigned long      wd_last_rx_bytes;
+	int                wd_stall_count;
+
 	volatile struct control_page *cp;
 	dma_addr_t cp_phys;
 
@@ -1026,6 +1032,8 @@ static netdev_tx_t xmm7360_net_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	xn->queued_packets++;
 	xn->queued_bytes += 16 + skb->len;
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
 	skb_queue_tail(&xn->queue, skb);
 
 	spin_unlock_irqrestore(&xn->lock, flags);
@@ -1093,6 +1101,10 @@ static void xmm7360_net_mux_handle_frame(struct xmm_net *xn, u8 *data, int len)
 			return;
 		}
 
+		if (xn->xmm->netdev) {
+			xn->xmm->netdev->stats.rx_packets++;
+			xn->xmm->netdev->stats.rx_bytes += skb->len;
+		}
 		netif_rx(skb);
 	}
 }
@@ -1284,7 +1296,8 @@ static void xmm7360_remove(struct pci_dev *dev)
 {
 	struct xmm_dev *xmm = pci_get_drvdata(dev);
 
-	/* Cancel pending kernel recovery before tearing down */
+	/* Cancel watchdog + pending recovery before tearing down */
+	del_timer_sync(&xmm->watchdog);
 	cancel_work_sync(&xmm->recovery_work);
 
 	xmm7360_dev_deinit(xmm);
@@ -1573,6 +1586,61 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 }
 
 /*
+ * Data-flow watchdog (option 2).
+ *
+ * Fires every 30s. If we are sending packets but receiving none for
+ * 2 minutes straight (4 consecutive intervals), assume the modem has
+ * silently stalled and trigger kernel-level recovery.
+ *
+ * Pure idle (no TX activity) is fine — the user just isn't using the
+ * connection. Only one-way traffic indicates a stall worth recovering.
+ */
+#define XMM_WATCHDOG_INTERVAL  (30 * HZ)
+#define XMM_WATCHDOG_STALL_MAX 4    /* 4 * 30s = 2 min */
+
+static void xmm7360_watchdog(struct timer_list *t)
+{
+	struct xmm_dev *xmm = from_timer(xmm, t, watchdog);
+	struct net_device *dev = xmm->netdev;
+	unsigned long tx, rx;
+
+	if (!dev || xmm->error || work_pending(&xmm->recovery_work)) {
+		/* not running or recovery already in flight */
+		xmm->wd_stall_count   = 0;
+		xmm->wd_last_tx_bytes = 0;
+		xmm->wd_last_rx_bytes = 0;
+		goto rearm;
+	}
+
+	tx = dev->stats.tx_bytes;
+	rx = dev->stats.rx_bytes;
+
+	if (tx > xmm->wd_last_tx_bytes && rx == xmm->wd_last_rx_bytes) {
+		/* sending but not receiving — stall */
+		xmm->wd_stall_count++;
+		dev_warn(xmm->dev,
+			 "watchdog: tx flowing but no rx (%d/%d)\n",
+			 xmm->wd_stall_count, XMM_WATCHDOG_STALL_MAX);
+
+		if (xmm->wd_stall_count >= XMM_WATCHDOG_STALL_MAX) {
+			dev_err(xmm->dev,
+				"watchdog: 2-minute one-way stall — triggering recovery\n");
+			xmm->wd_stall_count = 0;
+			xmm->error = -ENODEV;
+			schedule_work(&xmm->recovery_work);
+		}
+	} else {
+		xmm->wd_stall_count = 0;
+	}
+
+	xmm->wd_last_tx_bytes = tx;
+	xmm->wd_last_rx_bytes = rx;
+
+rearm:
+	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
+}
+
+/*
  * Kernel-level error recovery.
  *
  * Triggered by xmm7360_poll() when the modem reports the 0xbadc0ded
@@ -1694,6 +1762,8 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	INIT_WORK(&xmm->init_work, xmm7360_dev_init_work);
 	INIT_WORK(&xmm->recovery_work, xmm7360_recovery_work);
 	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
+	timer_setup(&xmm->watchdog, xmm7360_watchdog, 0);
+	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
 
 	xmm->irq = pci_irq_vector(dev, 0);
 	ret = request_irq(xmm->irq, xmm7360_irq0, 0, "xmm7360", xmm);

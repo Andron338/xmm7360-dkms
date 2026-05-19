@@ -1,57 +1,61 @@
 [Unit]
-Description=XMM7360 Modem Recovery (disconnect + reinit or module reload)
+Description=XMM7360 Modem Recovery (with retries + exponential backoff)
 
 [Service]
 Type=oneshot
 RemainAfterExit=no
 
 ExecStart=/bin/sh -c '\
-    logger -t xmm7360-recovery "Starting recovery"; \
-    \
-    systemctl stop xmm7360-init.service 2>/dev/null || true; \
-    rm -f /run/xmm7360-init.done; \
-    \
-    logger -t xmm7360-recovery "Attempting clean RPC disconnect"; \
-    if open_xdatachannel --disconnect 2>/dev/null; then \
-        logger -t xmm7360-recovery "RPC disconnect succeeded — reinitialising"; \
-        open_xdatachannel --init-only && { \
-            touch /run/xmm7360-init.done; \
-            logger -t xmm7360-recovery "Reinit succeeded — no module reload needed"; \
-            mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
-            logger -t xmm7360-recovery "Recovery complete (fast path)"; \
-            exit 0; \
-        }; \
-        logger -t xmm7360-recovery "Reinit failed — falling back to module reload"; \
-    else \
-        logger -t xmm7360-recovery "RPC disconnect failed — using module reload"; \
-    fi; \
-    \
-    logger -t xmm7360-recovery "Unloading module"; \
-    if ! modprobe -r xmm7360 2>/dev/null; then \
-        logger -t xmm7360-recovery "modprobe -r failed — stopping ModemManager"; \
-        systemctl stop ModemManager; \
-        modprobe -r xmm7360 || { \
-            logger -t xmm7360-recovery "ERROR: cannot unload module"; \
-            exit 1; \
-        }; \
-    fi; \
-    \
-    logger -t xmm7360-recovery "Loading module"; \
-    modprobe xmm7360; \
-    udevadm settle; \
-    \
-    logger -t xmm7360-recovery "Starting RPC init"; \
-    systemctl start xmm7360-init.service; \
-    \
-    logger -t xmm7360-recovery "Restarting ModemManager"; \
-    systemctl restart ModemManager; \
-    \
-    for i in $(seq 1 30); do \
-        mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
-        sleep 1; \
+    attempt=1; \
+    max_attempts=3; \
+    while [ $attempt -le $max_attempts ]; do \
+        logger -t xmm7360-recovery "Recovery attempt $attempt/$max_attempts"; \
+        \
+        systemctl stop xmm7360-init.service 2>/dev/null || true; \
+        rm -f /run/xmm7360-init.done; \
+        \
+        # Fast path: clean RPC disconnect + reinit (no module reload) \
+        logger -t xmm7360-recovery "Trying clean RPC disconnect"; \
+        if open_xdatachannel --disconnect 2>/dev/null; then \
+            . /etc/xmm7360.conf 2>/dev/null || true; \
+            if open_xdatachannel --apn ${XMM_APN:-internet} --metric ${XMM_METRIC:-1000} 2>/dev/null; then \
+                touch /run/xmm7360-init.done; \
+                mmcli -m 0 --signal-setup=5 2>/dev/null || true; \
+                logger -t xmm7360-recovery "Recovery complete (fast path, attempt $attempt)"; \
+                exit 0; \
+            fi; \
+        fi; \
+        \
+        # Slow path: full module reload \
+        logger -t xmm7360-recovery "Falling back to module reload"; \
+        if modprobe -r xmm7360 2>/dev/null || { systemctl stop ModemManager; modprobe -r xmm7360; }; then \
+            modprobe xmm7360; \
+            udevadm settle; \
+            systemctl start xmm7360-init.service 2>/dev/null || true; \
+            systemctl restart ModemManager; \
+            for i in $(seq 1 30); do \
+                mmcli -m 0 --signal-setup=5 2>/dev/null && break; \
+                sleep 1; \
+            done; \
+            \
+            # Verify modem actually came back \
+            if mmcli -m 0 2>/dev/null | grep -q "state:.*registered\\|state:.*connected\\|state:.*enabled"; then \
+                logger -t xmm7360-recovery "Recovery complete (module reload, attempt $attempt)"; \
+                exit 0; \
+            fi; \
+        fi; \
+        \
+        # Failed — back off and retry \
+        if [ $attempt -lt $max_attempts ]; then \
+            delay=$((5 * (1 << (attempt - 1)))); \
+            logger -t xmm7360-recovery "Attempt $attempt failed; backing off ${delay}s"; \
+            sleep $delay; \
+        fi; \
+        attempt=$((attempt + 1)); \
     done; \
     \
-    logger -t xmm7360-recovery "Recovery complete (module reload path)"'
+    logger -t xmm7360-recovery "ERROR: all $max_attempts recovery attempts failed"; \
+    exit 1'
 
 StandardOutput=journal
 StandardError=journal
