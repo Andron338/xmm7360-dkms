@@ -195,6 +195,9 @@ struct td_ring {
 
 struct queue_pair {
 	struct xmm_dev *xmm;
+	/* Stall-detection counters (read by xmm7360_watchdog) */
+	unsigned long tx_bytes;
+	unsigned long rx_bytes;
 	u8 depth;
 	u16 page_size;
 	struct cdev cdev;
@@ -665,6 +668,7 @@ static size_t xmm7360_qp_write(struct queue_pair *qp, const char *buf,
 		size = page_size;
 	xmm7360_td_ring_write(xmm, qp->num * 2, buf, size);
 	xmm7360_ding(xmm, DOORBELL_TD);
+	qp->tx_bytes += size;   /* for watchdog */
 	return size;
 }
 
@@ -701,6 +705,7 @@ static void xmm7360_tty_poll_qp(struct queue_pair *qp)
 		nread = ring->tds[idx].length;
 		tty_insert_flip_string(&qp->port, ring->pages[idx], nread);
 		tty_flip_buffer_push(&qp->port);
+		qp->rx_bytes += nread;   /* for watchdog */
 
 		xmm7360_td_ring_read(xmm, qp->num * 2 + 1);
 		xmm7360_ding(xmm, DOORBELL_TD);
@@ -1636,7 +1641,7 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 	return 0;
 
 fail:
-	/* Cleanup partial init so we do not leave orphan /dev/xmm0/* nodes
+	/* Cleanup partial init so we do not leave orphan /dev/xmm0/X nodes
 	 * holding module refs and forcing "module in use" failures. */
 	dev_err(xmm->dev, "dev_init failed (%d), cleaning up\n", ret);
 	xmm7360_dev_deinit(xmm);
