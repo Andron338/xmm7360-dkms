@@ -1297,7 +1297,11 @@ static void xmm7360_remove(struct pci_dev *dev)
 	struct xmm_dev *xmm = pci_get_drvdata(dev);
 
 	/* Cancel watchdog + pending recovery before tearing down */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	timer_delete_sync(&xmm->watchdog);
+#else
 	del_timer_sync(&xmm->watchdog);
+#endif
 	cancel_work_sync(&xmm->recovery_work);
 
 	xmm7360_dev_deinit(xmm);
@@ -1419,7 +1423,11 @@ static void xmm7360_tty_port_shutdown(struct tty_port *tport)
  * pppd uses DTR drop to signal hangup. Treat clearing both lines as a
  * hint to stop the queue pair so the modem sees a fresh state on reopen.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+static void xmm7360_tty_port_dtr_rts(struct tty_port *tport, bool raise)
+#else
 static void xmm7360_tty_port_dtr_rts(struct tty_port *tport, int raise)
+#endif
 {
 	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
 	if (!raise && qp->open)
@@ -1600,7 +1608,11 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 
 static void xmm7360_watchdog(struct timer_list *t)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	struct xmm_dev *xmm = timer_container_of(xmm, t, watchdog);
+#else
 	struct xmm_dev *xmm = from_timer(xmm, t, watchdog);
+#endif
 	struct net_device *dev = xmm->netdev;
 	unsigned long tx, rx;
 
