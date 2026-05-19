@@ -1,0 +1,75 @@
+#!/bin/bash
+# xmm7360-reset — manual recovery when the automatic flow fails
+#
+# Tries every escalation level to forcibly reload the module:
+#   1. stop init service + MM
+#   2. kill pppd, open_xdatachannel
+#   3. force-close all fds on our devices via fuser
+#   4. take NM connections offline if needed
+#   5. modprobe -r/modprobe
+#
+# Use when `mmcli -m 0` shows nothing, the modem won't come back, and
+# `modprobe -r xmm7360` says "module is in use".
+
+set -e
+
+log() { echo "[xmm7360-reset] $*"; logger -t xmm7360-reset "$*" 2>/dev/null || true; }
+
+if [ "$EUID" -ne 0 ]; then
+    echo "must run as root (try: sudo xmm7360-reset)" >&2
+    exit 1
+fi
+
+log "manual reset requested"
+
+log "stopping services"
+systemctl stop xmm7360-init.service 2>/dev/null || true
+systemctl stop ModemManager 2>/dev/null || true
+rm -f /run/xmm7360-init.done
+sleep 1
+
+log "killing pppd / open_xdatachannel"
+pkill -9 -x pppd 2>/dev/null || true
+pkill -9 -f open_xdatachannel 2>/dev/null || true
+sleep 1
+
+if lsmod | grep -q '^xmm7360'; then
+    log "force-closing fds on /dev/ttyXMM* and /dev/xmm0/*"
+    fuser -k -9 /dev/ttyXMM* 2>/dev/null || true
+    fuser -k -9 /dev/xmm0/* 2>/dev/null || true
+    sleep 1
+fi
+
+if lsmod | grep -q '^xmm7360' && ! timeout 5 modprobe -r xmm7360 2>/dev/null; then
+    log "module still busy — bringing NM connections offline"
+    active=$(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null | \
+             grep -E ":gsm$|:ppp$" | cut -d: -f1 || true)
+    for uuid in $active; do
+        log "nmcli connection down $uuid"
+        nmcli connection down "$uuid" 2>/dev/null || true
+    done
+    pkill -9 -x pppd 2>/dev/null || true
+    fuser -k -9 /dev/ttyXMM* /dev/xmm0/* 2>/dev/null || true
+    sleep 1
+fi
+
+if lsmod | grep -q '^xmm7360'; then
+    if ! timeout 10 modprobe -r xmm7360; then
+        log "ERROR: cannot unload module. Diagnostic:"
+        lsmod | grep xmm7360
+        fuser -v /dev/ttyXMM* /dev/xmm0/* 2>&1 || true
+        ps -eo pid,stat,wchan:30,comm | grep -E 'pppd|open_xdata|mmcli' | grep -v grep || true
+        exit 1
+    fi
+fi
+
+log "loading module"
+modprobe xmm7360
+udevadm settle
+
+log "restarting ModemManager"
+systemctl restart ModemManager 2>/dev/null || true
+sleep 2
+
+log "done"
+mmcli -L 2>/dev/null || true

@@ -1677,6 +1677,22 @@ static void xmm7360_watchdog(struct timer_list *t)
 	tx = dev->stats.tx_bytes;
 	rx = dev->stats.rx_bytes;
 
+	/*
+	 * Also count traffic on TTY queue pairs (ttyXMM ports).
+	 * When MM/pppd send AT commands and the modem stops responding,
+	 * we see TX on a QP with no matching RX — same stall pattern.
+	 */
+	{
+		int i;
+		for (i = 0; i < 8; i++) {
+			struct queue_pair *qp = &xmm->qp[i];
+			if (qp->xmm == xmm && qp->port.ops) {
+				tx += qp->tx_bytes;
+				rx += qp->rx_bytes;
+			}
+		}
+	}
+
 	if (tx > xmm->wd_last_tx_bytes && rx == xmm->wd_last_rx_bytes) {
 		/* sending but not receiving — stall */
 		xmm->wd_stall_count++;
