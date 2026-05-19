@@ -1,0 +1,176 @@
+name: Kernel Module CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel:
+          - linux
+          - linux-lts
+          - linux-zen
+        compiler:
+          - gcc
+          - clang
+
+    container:
+      image: archlinux:latest
+
+    env:
+      KERNEL: ${{ matrix.kernel }}
+      COMPILER: ${{ matrix.compiler }}
+
+    steps:
+      # ─────────────────────────────
+      # Checkout
+      # ─────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────
+      # System setup
+      # ─────────────────────────────
+      - name: Update system
+        run: |
+          pacman -Syu --noconfirm
+
+      - name: Install dependencies
+        run: |
+          pacman -S --noconfirm \
+            base-devel \
+            git \
+            sudo \
+            make \
+            gcc \
+            clang \
+            llvm \
+            sparse \
+            cppcheck \
+            bc \
+            pahole \
+            $KERNEL \
+            $KERNEL-headers
+
+      # ─────────────────────────────
+      # Cache pacman packages
+      # ─────────────────────────────
+      - name: Cache pacman packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/pacman/pkg
+          key: pacman-${{ matrix.kernel }}-${{ matrix.compiler }}
+
+      # ─────────────────────────────
+      # Create non-root user
+      # ─────────────────────────────
+      - name: Create builder user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      # ─────────────────────────────
+      # Fix permissions
+      # ─────────────────────────────
+      - name: Fix repository ownership
+        run: |
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      # ─────────────────────────────
+      # Build module
+      # ─────────────────────────────
+      - name: Build kernel module
+        run: |
+          su builder -c "
+            cd $GITHUB_WORKSPACE &&
+
+            export KERNEL_VERSION=$KERNEL &&
+
+            if [ \"$COMPILER\" = \"clang\" ]; then
+              export CC=clang
+              export HOSTCC=clang
+            else
+              export CC=gcc
+              export HOSTCC=gcc
+            fi &&
+
+            make clean || true &&
+
+            make \
+              KDIR=/usr/lib/modules/$KERNEL/build \
+              EXTRA_CFLAGS='-Wall -Wextra -Werror'
+          "
+
+      # ─────────────────────────────
+      # Verify module exists
+      # ─────────────────────────────
+      - name: Verify built module
+        run: |
+          find . -name "*.ko"
+          test "$(find . -name '*.ko' | wc -l)" -gt 0
+
+      # ─────────────────────────────
+      # modinfo validation
+      # ─────────────────────────────
+      - name: Validate module metadata
+        run: |
+          for mod in $(find . -name '*.ko'); do
+            modinfo "$mod"
+          done
+
+      # ─────────────────────────────
+      # Run sparse static analysis
+      # ─────────────────────────────
+      - name: Sparse analysis
+        run: |
+          su builder -c "
+            cd $GITHUB_WORKSPACE &&
+
+            make clean || true &&
+
+            make \
+              C=1 \
+              CHECK=sparse \
+              KDIR=/usr/lib/modules/$KERNEL/build
+          "
+
+      # ─────────────────────────────
+      # Run cppcheck
+      # ─────────────────────────────
+      - name: Cppcheck analysis
+        run: |
+          cppcheck \
+            --enable=all \
+            --inconclusive \
+            --force \
+            --inline-suppr \
+            --error-exitcode=1 \
+            .
+
+      # ─────────────────────────────
+      # Upload kernel modules
+      # ─────────────────────────────
+      - name: Upload kernel modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-${{ matrix.kernel }}-${{ matrix.compiler }}
+          path: |
+            **/*.ko
+
+      # ─────────────────────────────
+      # Upload logs / artifacts
+      # ─────────────────────────────
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts-${{ matrix.kernel }}-${{ matrix.compiler }}
+          path: |
+            **/*.pkg.tar.zst
+            **/*.log
