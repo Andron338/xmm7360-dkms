@@ -16,6 +16,7 @@ depends=(
     'util-linux-libs'
     'networkmanager'
     'modemmanager'
+    'psmisc'         # fuser, for recovery service
 )
 makedepends=('linux-headers' 'git')
 optdepends=('linux-headers: required by DKMS on kernel update')

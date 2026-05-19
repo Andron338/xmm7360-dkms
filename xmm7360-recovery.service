@@ -1,7 +1,6 @@
 [Unit]
-Description=XMM7360 module reload (last-resort recovery)
-# Only invoked by udev when the kernel emits XMM7360_STATE=failed
-# after exhausting its in-module recovery budget.
+Description=XMM7360 module reload (last-resort recovery, escalating force)
+# Triggered by udev when kernel emits XMM7360_STATE=failed.
 
 [Service]
 Type=oneshot
@@ -9,22 +8,73 @@ RemainAfterExit=no
 TimeoutStartSec=60
 
 ExecStart=/bin/sh -c '\
-    logger -t xmm7360-recovery "Kernel requested module reload"; \
+    logger -t xmm7360-recovery "Recovery requested"; \
+    \
+    # ── Level 1: gentle ────────────────────────────────────────────────── \
+    # Stop our init service first \
     systemctl stop xmm7360-init.service 2>/dev/null || true; \
     rm -f /run/xmm7360-init.done; \
     \
-    if ! timeout 5 modprobe -r xmm7360 2>/dev/null; then \
-        systemctl stop ModemManager; \
-        timeout 10 modprobe -r xmm7360 || { \
-            logger -t xmm7360-recovery "ERROR: cannot unload module"; \
-            exit 1; \
-        }; \
+    if timeout 3 modprobe -r xmm7360 2>/dev/null; then \
+        logger -t xmm7360-recovery "Unloaded directly"; \
+    else \
+        # ── Level 2: stop the obvious holders ──────────────────────────── \
+        logger -t xmm7360-recovery "Module busy; stopping MM"; \
+        systemctl stop ModemManager 2>/dev/null || true; \
+        sleep 1; \
+        \
+        if timeout 3 modprobe -r xmm7360 2>/dev/null; then \
+            logger -t xmm7360-recovery "Unloaded after MM stop"; \
+        else \
+            # ── Level 3: find and kill processes holding our devices ──── \
+            logger -t xmm7360-recovery "Still busy; killing holders"; \
+            \
+            # pppd is launched by NM and holds ttyXMM2 \
+            pkill -9 -x pppd 2>/dev/null || true; \
+            pkill -9 -f open_xdatachannel 2>/dev/null || true; \
+            \
+            # fuser -k force-closes any remaining fds on our device nodes \
+            fuser -k -9 /dev/ttyXMM* 2>/dev/null || true; \
+            fuser -k -9 /dev/xmm0/* 2>/dev/null || true; \
+            \
+            sleep 1; \
+            \
+            if timeout 5 modprobe -r xmm7360 2>/dev/null; then \
+                logger -t xmm7360-recovery "Unloaded after force"; \
+            else \
+                # ── Level 4: take NM offline briefly to kill ppp0 ─────── \
+                logger -t xmm7360-recovery "Taking NM offline to release pppd"; \
+                active=$(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null | \
+                         grep ":gsm$\\|:ppp$" | cut -d: -f1); \
+                for uuid in $active; do \
+                    nmcli connection down "$uuid" 2>/dev/null || true; \
+                done; \
+                sleep 1; \
+                pkill -9 -x pppd 2>/dev/null || true; \
+                fuser -k -9 /dev/ttyXMM* /dev/xmm0/* 2>/dev/null || true; \
+                sleep 1; \
+                \
+                if ! timeout 5 modprobe -r xmm7360; then \
+                    logger -t xmm7360-recovery "ERROR: module still busy after all escalation"; \
+                    lsmod | grep xmm7360 | logger -t xmm7360-recovery; \
+                    fuser -v /dev/ttyXMM* /dev/xmm0/* 2>&1 | logger -t xmm7360-recovery; \
+                    exit 1; \
+                fi; \
+            fi; \
+        fi; \
     fi; \
     \
-    timeout 10 modprobe xmm7360; \
+    # ── Load fresh and restart services ─────────────────────────────────── \
+    timeout 10 modprobe xmm7360 || { \
+        logger -t xmm7360-recovery "ERROR: modprobe load failed"; \
+        exit 1; \
+    }; \
     udevadm settle; \
-    systemctl restart ModemManager; \
-    logger -t xmm7360-recovery "Module reload complete"'
+    \
+    # Restart MM so it re-probes the modem \
+    systemctl restart ModemManager 2>/dev/null || true; \
+    \
+    logger -t xmm7360-recovery "Recovery complete"'
 
 StandardOutput=journal
 StandardError=journal

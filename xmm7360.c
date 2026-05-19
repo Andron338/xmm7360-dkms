@@ -293,6 +293,23 @@ struct xmm_net {
 };
 
 /*
+ * Set xmm->error and wake every wait queue so blocked userspace
+ * syscalls return immediately. Without this, processes waiting in
+ * cdev_read/write on a wedged modem stay uninterruptible (D state),
+ * pkill -9 cannot kill them, and the module stays "in use" forever.
+ */
+static void xmm7360_set_error(struct xmm_dev *xmm, int err)
+{
+	int i;
+	xmm->error = err;
+	wake_up(&xmm->wq);
+	for (i = 0; i < 8; i++) {
+		if (xmm->qp[i].xmm == xmm)   /* qp is initialised */
+			wake_up(&xmm->qp[i].wq);
+	}
+}
+
+/*
  * Emit a uevent on the underlying PCI device so udev can trigger a
  * userspace service (modprobe reload, init re-run) without us needing
  * a long-running watch daemon.
@@ -318,11 +335,11 @@ static void xmm7360_poll(struct xmm_dev *xmm)
 
 	if (xmm->cp->status.code == 0xbadc0ded) {
 		dev_err(xmm->dev, "crashed but dma up\n");
-		xmm->error = -ENODEV;
+		xmm7360_set_error(xmm, -ENODEV);
 	}
 	if (xmm->bar2 && xmm->bar2[BAR2_STATUS] != 0x600df00d) {
 		dev_err(xmm->dev, "bad status %x\n", xmm->bar2[BAR2_STATUS]);
-		xmm->error = -ENODEV;
+		xmm7360_set_error(xmm, -ENODEV);
 	}
 
 	/* On transition OK -> error, schedule kernel-level recovery */
@@ -1295,7 +1312,7 @@ static irqreturn_t xmm7360_irq0(int irq, void *dev_id)
 static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 {
 	int i;
-	xmm->error = -ENODEV;
+	xmm7360_set_error(xmm, -ENODEV);
 
 	cancel_work_sync(&xmm->init_work);
 
@@ -1599,24 +1616,31 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 
 	ret = xmm7360_create_cdev(xmm, 1, "xmm%d/rpc", xmm->card_num);
 	if (ret)
-		return ret;
+		goto fail;
 	ret = xmm7360_create_cdev(xmm, 3, "xmm%d/trace", xmm->card_num);
 	if (ret)
-		return ret;
+		goto fail;
 	ret = xmm7360_create_tty(xmm, 2);
 	if (ret)
-		return ret;
+		goto fail;
 	ret = xmm7360_create_tty(xmm, 4);
 	if (ret)
-		return ret;
+		goto fail;
 	ret = xmm7360_create_tty(xmm, 7);
 	if (ret)
-		return ret;
+		goto fail;
 	ret = xmm7360_create_net(xmm);
 	if (ret)
-		return ret;
+		goto fail;
 
 	return 0;
+
+fail:
+	/* Cleanup partial init so we do not leave orphan /dev/xmm0/* nodes
+	 * holding module refs and forcing "module in use" failures. */
+	dev_err(xmm->dev, "dev_init failed (%d), cleaning up\n", ret);
+	xmm7360_dev_deinit(xmm);
+	return ret;
 }
 
 /*
@@ -1664,7 +1688,7 @@ static void xmm7360_watchdog(struct timer_list *t)
 			dev_err(xmm->dev,
 				"watchdog: 2-minute one-way stall — triggering recovery\n");
 			xmm->wd_stall_count = 0;
-			xmm->error = -ENODEV;
+			xmm7360_set_error(xmm, -ENODEV);
 			schedule_work(&xmm->recovery_work);
 		}
 	} else {
@@ -1748,7 +1772,7 @@ static void xmm7360_recovery_work(struct work_struct *work)
 		dev_err(xmm->dev,
 			"kernel recovery dev_init failed (%d) — module reload needed\n",
 			ret);
-		xmm->error = -ENODEV;
+		xmm7360_set_error(xmm, -ENODEV);
 		/* Re-enable IRQ so future remove() can run cleanly */
 		if (xmm->irq)
 			enable_irq(xmm->irq);
