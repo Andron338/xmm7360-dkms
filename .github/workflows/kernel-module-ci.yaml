@@ -17,6 +17,10 @@ jobs:
           - linux
           - linux-lts
           - linux-zen
+          - linux-rt
+          - linux-hardened
+          - linux-mainline
+          - linux-next-git
         compiler:
           - gcc
           - clang
@@ -50,6 +54,7 @@ jobs:
             sudo \
             make \
             gcc \
+            gcc13 \
             clang \
             llvm \
             sparse \

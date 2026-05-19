@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [linux, linux-lts, linux-zen]
+        kernel: [linux, linux-lts, linux-zen, linux-rt, linux-mainline, linux-next-git]
         gcc: [gcc, gcc13]
 
     container:
@@ -44,7 +44,8 @@ jobs:
       # ─────────────────────────────
       - name: Install kernel + compiler
         run: |
-          pacman -S --noconfirm $GCC_PKG $KERNEL $KERNEL-headers
+          pacman -S --noconfirm $GCC_PKG $KERNEL $KERNEL-headers \
+          gcc13
 
       # ─────────────────────────────
       # 4. Create non-root build user (required by makepkg)
