@@ -11,8 +11,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [linux, linux-lts, linux-zen, linux-rt, linux-mainline, linux-next-git]
-        gcc: [gcc, gcc13]
+        kernel: [linux, linux-lts, linux-zen, linux-rt, linux-hardened]
+        gcc: [gcc, gcc16]
 
     container:
       image: archlinux:latest
