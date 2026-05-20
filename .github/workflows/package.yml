@@ -1,10 +1,9 @@
 name: package
 
 # Lint and build the Arch package in a real Arch container.
-# Validates PKGBUILD syntax, .SRCINFO consistency, namcap warnings, and
-# that makepkg can at least build the userspace half (DKMS module build
-# is skipped — no kernel headers for the running CI kernel inside the
-# container, and DKMS install needs a real kernel).
+# Builds against the LOCAL checkout (not the GitHub remote) by rewriting the
+# PKGBUILD git source to a file:// URL pointing at this commit, so CI tests
+# exactly what you pushed. No .SRCINFO sync check (you don't maintain one).
 
 on:
   push:
@@ -23,55 +22,33 @@ on:
   workflow_dispatch:
 
 jobs:
-  pkgbuild-lint:
+  lint:
     name: PKGBUILD lint (namcap)
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install tools
-        run: |
-          pacman -Syu --noconfirm namcap git pkgconf
-
-      - name: Create build user
-        # makepkg refuses to run as root
-        run: |
-          useradd -m builder
-          chown -R builder:builder .
-
-      - name: Validate .SRCINFO is in sync
-        run: |
-          if [ -f .SRCINFO ]; then
-            su builder -c 'makepkg --printsrcinfo > /tmp/srcinfo.new'
-            if ! diff -q .SRCINFO /tmp/srcinfo.new; then
-              echo "::error::.SRCINFO is out of date — run: makepkg --printsrcinfo > .SRCINFO"
-              diff .SRCINFO /tmp/srcinfo.new || true
-              exit 1
-            fi
-          else
-            echo "::warning::no .SRCINFO present (generate with makepkg --printsrcinfo > .SRCINFO)"
-          fi
+        run: pacman -Syu --noconfirm --needed namcap pkgconf
 
       - name: namcap PKGBUILD
         run: |
-          namcap PKGBUILD 2>&1 | tee namcap.log
-          # namcap warnings are advisory; fail only on errors (E:)
-          if grep -E '^PKGBUILD \(.*\) E:' namcap.log; then
+          namcap PKGBUILD 2>&1 | tee namcap.log || true
+          # Fail only on namcap ERRORS (E:), not warnings.
+          if grep -E '^PKGBUILD.* E: ' namcap.log; then
             echo "::error::namcap reported errors"
             exit 1
           fi
 
-      - name: shellcheck the install hooks
+      - name: shellcheck install hooks
         run: |
-          pacman -S --noconfirm shellcheck
-          for f in *.install; do
+          pacman -S --noconfirm --needed shellcheck
+          for f in *.install xmm7360-reset; do
             [ -f "$f" ] || continue
-            echo "Checking $f"
-            # .install files are sourced; check the functions inside
+            echo "── $f ──"
             shellcheck -s bash -S warning "$f" || true
           done
 
@@ -83,40 +60,63 @@ jobs:
           path: namcap.log
           retention-days: 14
 
-  pkgbuild-build:
-    name: makepkg (userspace only)
+  build:
+    name: makepkg (userspace + DKMS source)
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # pkgver() needs full git history
 
       - name: Install build deps
         run: |
-          pacman -Syu --noconfirm git libnm openssl util-linux-libs \
-                                  networkmanager modemmanager psmisc dkms
+          pacman -Syu --noconfirm --needed \
+            base-devel git pkgconf openssl util-linux networkmanager \
+            modemmanager psmisc dkms
 
-      - name: Create build user
+      - name: Prepare local-source build
         run: |
+          # makepkg refuses root; create a builder user and hand it the repo.
           useradd -m builder
-          chown -R builder:builder .
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder:builder /home/builder/src
+          # git safe.directory so pkgver()'s git calls work for the builder
+          sudo -u builder git config --global --add safe.directory /home/builder/src
 
-      - name: makepkg (skip DKMS module compile)
+      - name: Point PKGBUILD at the local checkout
         run: |
-          # The package() step builds the tool via Makefile.tool, which is
-          # the userspace half we can validate here. The DKMS module source
-          # is just copied into place (not compiled at package time), so this
-          # exercises the full packaging path minus the kernel build.
-          su builder -c 'makepkg -sf --noconfirm --nocheck' 2>&1 | tee makepkg.log
+          cd /home/builder/src
+          # makepkg evaluates the whole PKGBUILD, so a trailing reassignment
+          # wins. Override the source to clone from this local checkout instead
+          # of GitHub — CI then tests exactly the committed code. pkgver() still
+          # works because the clone lands at src/xmm7360-pci as before.
+          sudo -u builder tee -a PKGBUILD >/dev/null <<'OVERRIDE'
+
+          # ── CI override: build from local checkout ──
+          source=("xmm7360-pci::git+file:///home/builder/src")
+          sha256sums=('SKIP')
+          OVERRIDE
+          echo "── effective source line ──"
+          grep -n '^source=' PKGBUILD || true
+
+      - name: makepkg
+        run: |
+          cd /home/builder/src
+          # --nocheck: the DKMS module isn't compiled at package time (it's
+          # compiled on the user's machine by DKMS); the kernel-module workflow
+          # validates the actual .ko compile.
+          sudo -u builder makepkg -sf --noconfirm --nocheck 2>&1 | tee makepkg.log
           ls -la *.pkg.tar.* || { echo "::error::no package produced"; exit 1; }
 
       - name: Inspect package contents
         run: |
+          cd /home/builder/src
           for pkg in *.pkg.tar.*; do
             echo "=== $pkg ==="
-            tar -tf "$pkg" | grep -vE '^\.' | sort
+            tar -tf "$pkg" | grep -vE '^\.(MTREE|PKGINFO|BUILDINFO)$' | sort
           done
 
       - name: Upload package
@@ -125,6 +125,6 @@ jobs:
         with:
           name: arch-package
           path: |
-            *.pkg.tar.*
-            makepkg.log
+            /home/builder/src/*.pkg.tar.*
+            /home/builder/src/makepkg.log
           retention-days: 14
