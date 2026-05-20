@@ -1807,6 +1807,11 @@ static void xmm7360_recovery_work(struct work_struct *work)
 	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
 
 	dev_info(xmm->dev, "kernel-level recovery complete\n");
+
+	/* Tell userspace the modem is fresh again so ModemManager re-probes
+	 * the recreated ttyXMM/wwan0 devices. Without this, MM keeps the old
+	 * (now-gone) modem object and reports "No modems were found". */
+	xmm7360_emit_uevent(xmm, "recovered");
 }
 
 void xmm7360_dev_init_work(struct work_struct *work)
