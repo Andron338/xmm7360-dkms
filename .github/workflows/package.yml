@@ -1,0 +1,130 @@
+name: package
+
+# Lint and build the Arch package in a real Arch container.
+# Validates PKGBUILD syntax, .SRCINFO consistency, namcap warnings, and
+# that makepkg can at least build the userspace half (DKMS module build
+# is skipped — no kernel headers for the running CI kernel inside the
+# container, and DKMS install needs a real kernel).
+
+on:
+  push:
+    paths:
+      - 'PKGBUILD'
+      - 'dkms.conf'
+      - 'Makefile.dkms'
+      - 'Makefile.tool'
+      - '*.install'
+      - '.github/workflows/package.yml'
+  pull_request:
+    paths:
+      - 'PKGBUILD'
+      - 'dkms.conf'
+      - '*.install'
+  workflow_dispatch:
+
+jobs:
+  pkgbuild-lint:
+    name: PKGBUILD lint (namcap)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm namcap git pkgconf
+
+      - name: Create build user
+        # makepkg refuses to run as root
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+
+      - name: Validate .SRCINFO is in sync
+        run: |
+          if [ -f .SRCINFO ]; then
+            su builder -c 'makepkg --printsrcinfo > /tmp/srcinfo.new'
+            if ! diff -q .SRCINFO /tmp/srcinfo.new; then
+              echo "::error::.SRCINFO is out of date — run: makepkg --printsrcinfo > .SRCINFO"
+              diff .SRCINFO /tmp/srcinfo.new || true
+              exit 1
+            fi
+          else
+            echo "::warning::no .SRCINFO present (generate with makepkg --printsrcinfo > .SRCINFO)"
+          fi
+
+      - name: namcap PKGBUILD
+        run: |
+          namcap PKGBUILD 2>&1 | tee namcap.log
+          # namcap warnings are advisory; fail only on errors (E:)
+          if grep -E '^PKGBUILD \(.*\) E:' namcap.log; then
+            echo "::error::namcap reported errors"
+            exit 1
+          fi
+
+      - name: shellcheck the install hooks
+        run: |
+          pacman -S --noconfirm shellcheck
+          for f in *.install; do
+            [ -f "$f" ] || continue
+            echo "Checking $f"
+            # .install files are sourced; check the functions inside
+            shellcheck -s bash -S warning "$f" || true
+          done
+
+      - name: Upload namcap log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: namcap-log
+          path: namcap.log
+          retention-days: 14
+
+  pkgbuild-build:
+    name: makepkg (userspace only)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          pacman -Syu --noconfirm git libnm openssl util-linux-libs \
+                                  networkmanager modemmanager psmisc dkms
+
+      - name: Create build user
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+
+      - name: makepkg (skip DKMS module compile)
+        run: |
+          # The package() step builds the tool via Makefile.tool, which is
+          # the userspace half we can validate here. The DKMS module source
+          # is just copied into place (not compiled at package time), so this
+          # exercises the full packaging path minus the kernel build.
+          su builder -c 'makepkg -sf --noconfirm --nocheck' 2>&1 | tee makepkg.log
+          ls -la *.pkg.tar.* || { echo "::error::no package produced"; exit 1; }
+
+      - name: Inspect package contents
+        run: |
+          for pkg in *.pkg.tar.*; do
+            echo "=== $pkg ==="
+            tar -tf "$pkg" | grep -vE '^\.' | sort
+          done
+
+      - name: Upload package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: |
+            *.pkg.tar.*
+            makepkg.log
+          retention-days: 14

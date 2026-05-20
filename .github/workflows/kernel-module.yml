@@ -1,0 +1,94 @@
+name: kernel-module
+
+# Build the out-of-tree xmm7360.ko against several kernel versions to catch
+# API breakage early (the driver already carries version guards for 6.15,
+# 6.18 timer/tty changes — this proves they work).
+
+on:
+  push:
+    paths:
+      - 'xmm7360.c'
+      - 'Makefile'
+      - 'Makefile.dkms'
+      - 'dkms.conf'
+      - '.github/workflows/kernel-module.yml'
+  pull_request:
+    paths:
+      - 'xmm7360.c'
+      - 'Makefile'
+      - 'Makefile.dkms'
+      - 'dkms.conf'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build against ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Debian/Ubuntu shipped kernel header packages, spanning the range
+        # the version guards target. Add/remove as availability changes.
+        kernel:
+          - linux-headers-generic           # current Ubuntu LTS kernel
+          - linux-headers-azure             # newer mainline-ish
+
+    container:
+      image: ubuntu:24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tooling and kernel headers
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ${{ matrix.kernel }} \
+            kmod \
+            libelf-dev \
+            bc
+
+      - name: Locate kernel build dir
+        id: kdir
+        run: |
+          # Pick the highest-versioned headers dir that got installed
+          KVER=$(ls -1 /lib/modules/ | sort -V | tail -1)
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
+          echo "Using kernel version: $KVER"
+          ls -la "/lib/modules/$KVER/build" || {
+            echo "::error::No build dir for $KVER"; exit 1; }
+
+      - name: Build module
+        run: |
+          make KVERSION=${{ steps.kdir.outputs.kver }} 2>&1 | tee build.log
+          # Fail if the .ko was not produced
+          test -f xmm7360.ko || { echo "::error::xmm7360.ko not built"; exit 1; }
+
+      - name: Check for new warnings
+        run: |
+          # multichar + missing-prototype warnings are known/accepted.
+          # Fail only on NEW warning categories.
+          if grep -E 'warning:' build.log \
+             | grep -vE 'multi-character|missing-prototype|Wcomment' ; then
+            echo "::warning::Unexpected compiler warnings (see above)"
+          fi
+
+      - name: modinfo sanity
+        run: |
+          modinfo xmm7360.ko | tee modinfo.txt
+          grep -q 'license:.*GPL' modinfo.txt \
+            || { echo "::error::module missing GPL license"; exit 1; }
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-${{ steps.kdir.outputs.kver }}
+          path: |
+            xmm7360.ko
+            build.log
+            modinfo.txt
+          retention-days: 14

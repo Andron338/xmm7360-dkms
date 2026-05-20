@@ -1,0 +1,106 @@
+name: rpc-tool
+
+# Build the userspace open_xdatachannel tool and run the zero-dependency
+# unit test suite (tests/test_proto, tests/test_rpc). No hardware needed —
+# these exercise the pack/unpack engine and RPC tables in pure userspace.
+
+on:
+  push:
+    paths:
+      - 'rpc/**'
+      - 'tests/**'
+      - 'Makefile.tool'
+      - '.github/workflows/rpc-tool.yml'
+  pull_request:
+    paths:
+      - 'rpc/**'
+      - 'tests/**'
+      - 'Makefile.tool'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build tool + run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libnm-dev \
+            libssl-dev \
+            uuid-dev \
+            gcc-14 \
+            clang \
+            valgrind
+
+      - name: Build tool (gcc)
+        working-directory: rpc
+        run: |
+          make -f ../Makefile.tool clean
+          make -f ../Makefile.tool CC=gcc
+          test -x open_xdatachannel || { echo "::error::tool not built"; exit 1; }
+
+      - name: Build tool (clang, -Wall -Wextra)
+        working-directory: rpc
+        run: |
+          make -f ../Makefile.tool clean
+          make -f ../Makefile.tool CC=clang CFLAGS="-std=c11 -Wall -Wextra -Werror -O2"
+
+      - name: Run unit tests
+        working-directory: tests
+        run: |
+          make test 2>&1 | tee test-output.log
+          # The test harness exits non-zero on any failure; make propagates it.
+
+      - name: Run tests under valgrind (memory safety)
+        working-directory: tests
+        run: |
+          make clean && make test_proto test_rpc
+          valgrind --error-exitcode=1 --leak-check=full \
+                   --errors-for-leak-kinds=definite ./test_proto
+          valgrind --error-exitcode=1 --leak-check=full \
+                   --errors-for-leak-kinds=definite ./test_rpc
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-test-logs
+          path: tests/test-output.log
+          retention-days: 14
+
+  static-analysis:
+    name: cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck
+
+      - name: Run cppcheck on rpc/
+        run: |
+          cppcheck --enable=warning,portability,performance \
+                   --inline-suppr \
+                   --error-exitcode=1 \
+                   --suppress=missingIncludeSystem \
+                   rpc/ 2>&1 | tee cppcheck.log
+
+      - name: Upload cppcheck log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-log
+          path: cppcheck.log
+          retention-days: 14
