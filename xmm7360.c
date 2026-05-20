@@ -1767,7 +1767,7 @@ rearm:
  * xmm7360_do_rebuild - tear the device down and recreate it in place.
  *
  * This is the in-kernel equivalent of `modprobe -r xmm7360 && modprobe
- * xmm7360` minus unloading the .ko: it destroys wwan0/ttyXMM*/cdevs +
+ * xmm7360` minus unloading the .ko: it destroys wwan0, ttyXMM, cdevs,
  * DMA rings, re-handshakes the firmware, and recreates everything just
  * like a fresh probe. Callers must NOT hold tty/rtnl locks (runs from a
  * workqueue). Returns 0 on success, negative on failure (device left
