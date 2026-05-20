@@ -233,6 +233,7 @@ struct xmm_dev {
 	unsigned long      wd_last_tx_bytes;
 	unsigned long      wd_last_rx_bytes;
 	int                wd_stall_count;
+	unsigned long      last_disconnect_jiffies;
 
 	volatile struct control_page *cp;
 	dma_addr_t cp_phys;
@@ -1475,9 +1476,17 @@ static void xmm7360_tty_port_shutdown(struct tty_port *tport)
 	 * tx_bytes so a bare probe-open does not cycle the modem needlessly.
 	 */
 	if (had_session && qp->xmm && !qp->xmm->error) {
+		struct xmm_dev *xmm = qp->xmm;
 		qp->tx_bytes = 0;
 		qp->rx_bytes = 0;
-		xmm7360_emit_uevent(qp->xmm, "disconnected");
+		/* Coalesce: several AT QPs tear down together on one PPP
+		 * disconnect — emit at most one uevent per 5s so we trigger a
+		 * single modem cycle, not five. */
+		if (!xmm->last_disconnect_jiffies ||
+		    time_after(jiffies, xmm->last_disconnect_jiffies + 5 * HZ)) {
+			xmm->last_disconnect_jiffies = jiffies;
+			xmm7360_emit_uevent(xmm, "disconnected");
+		}
 	}
 }
 

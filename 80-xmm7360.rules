@@ -21,7 +21,7 @@ SUBSYSTEM=="tty", KERNEL=="ttyXMM1", ACTION=="add", \
 ACTION=="change", SUBSYSTEM=="pci", \
     ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
     ENV{XMM7360_STATE}=="failed", \
-    TAG+="systemd", ENV{SYSTEMD_WANTS}="xmm7360-recovery.service"
+    RUN+="/usr/bin/systemctl --no-block start xmm7360-recovery.service"
 
 ACTION=="change", SUBSYSTEM=="pci", \
     ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
@@ -33,7 +33,7 @@ ACTION=="change", SUBSYSTEM=="pci", \
 ACTION=="change", SUBSYSTEM=="pci", \
     ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
     ENV{XMM7360_STATE}=="disconnected", \
-    TAG+="systemd", ENV{SYSTEMD_WANTS}="xmm7360-cleanup.service"
+    RUN+="/usr/bin/systemctl --no-block start xmm7360-cleanup.service"
 
 # After kernel-level recovery rebuilds the devices, re-run RPC init
 # and force ModemManager to re-scan (it lost the old modem object).
