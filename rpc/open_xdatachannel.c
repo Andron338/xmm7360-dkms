@@ -3,7 +3,6 @@
  *
  * C port of open_xdatachannel.py.  Replaces all Python dependencies:
  *   pyroute2         → rtnetlink (xmm_netlink.c)
- *   dbus / xm_dbus   → libnm     (xmm_nm.c)
  *   rpc              → xmm_rpc.c + xmm_proto.c
  *   configargparse   → getopt_long + simple INI reader
  *
@@ -30,7 +29,6 @@
 #include "xmm_rpc.h"
 #include "xmm_rpc_ids.h"
 #include "xmm_netlink.h"
-#include "xmm_nm.h"
 
 /* ── Configuration ───────────────────────────────────────────────────────── */
 
@@ -40,7 +38,6 @@ typedef struct {
     int  metric;
     int  ip_fetch_timeout;
     int  no_resolv;
-    int  use_nm;
     int  init_only;   /* --init-only: wake modem for ModemManager, then exit */
     int  disconnect;  /* --disconnect: clean RPC teardown, then exit */
     char device[256];
@@ -52,7 +49,6 @@ static void cfg_defaults(cfg_t *c) {
     c->metric           = 1000;
     c->ip_fetch_timeout = 1;
     c->no_resolv        = 0;
-    c->use_nm           = 0;
     c->device[0]        = '\0';
     c->init_only        = 0;
     c->disconnect       = 0;
@@ -87,7 +83,6 @@ static void load_ini(cfg_t *c, const char *path) {
         else if (strcmp(key, "ip_fetch_timeout") == 0) c->ip_fetch_timeout = atoi(val);
         else if (strcmp(key, "nodefaultroute")   == 0) c->no_default_route = atoi(val);
         else if (strcmp(key, "noresolv")         == 0) c->no_resolv        = atoi(val);
-        else if (strcmp(key, "dbus")             == 0) c->use_nm           = atoi(val);
     }
     fclose(f);
 }
@@ -102,7 +97,6 @@ static void usage(const char *prog) {
         "  -m, --metric <n>             Route metric (default: 1000)\n"
         "  -t, --ip-fetch-timeout <n>   Retry interval for IP fetch (default: 1s)\n"
         "  -r, --noresolv               Do not write DNS to /etc/resolv.conf\n"
-        "  -d, --dbus                   Activate connection via NetworkManager\n"
         "  -c, --conf <file>            Config file path\n"
         "  -i, --init-only              Init modem for ModemManager (no data channel)\n"
         "  -x, --disconnect             RPC teardown + interface down, then exit\n"
@@ -145,7 +139,6 @@ int main(int argc, char *argv[]) {
         {"metric",           required_argument, NULL, 'm'},
         {"ip-fetch-timeout", required_argument, NULL, 't'},
         {"noresolv",         no_argument,       NULL, 'r'},
-        {"dbus",             no_argument,       NULL, 'd'},
         {"conf",             required_argument, NULL, 'c'},
         {"device",           required_argument, NULL, 'D'},
         {"init-only",        no_argument,       NULL, 'i'},
@@ -155,14 +148,13 @@ int main(int argc, char *argv[]) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "a:nm:t:rdc:hD:ix", longopts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "a:nm:t:rc:hD:ix", longopts, NULL)) != -1) {
         switch (opt) {
         case 'a': snprintf(cfg.apn, sizeof(cfg.apn), "%s", optarg); break;
         case 'n': cfg.no_default_route = 1; break;
         case 'm': cfg.metric           = atoi(optarg); break;
         case 't': cfg.ip_fetch_timeout = atoi(optarg); break;
         case 'r': cfg.no_resolv        = 1; break;
-        case 'd': cfg.use_nm           = 1; break;
         case 'c': load_ini(&cfg, optarg); break;
         case 'D': snprintf(cfg.device, sizeof(cfg.device), "%s", optarg); break;
         case 'i': cfg.init_only = 1; break;
@@ -474,17 +466,6 @@ int main(int argc, char *argv[]) {
         } else {
             perror("open /etc/resolv.conf");
         }
-    }
-
-    /* ── Step 9: NetworkManager (optional) ───────────────────────────────── */
-    if (cfg.use_nm) {
-        fprintf(stderr, "Configuring NetworkManager...\n");
-        if (xmm_nm_setup(ip_str, (const char (*)[16])dns_v4, ndns_v4, cfg.metric) < 0) {
-            fprintf(stderr, "NetworkManager setup failed\n");
-            xmm_rpc_close(&rpc);
-            return 1;
-        }
-        fprintf(stderr, "NetworkManager connection activated\n");
     }
 
     xmm_rpc_close(&rpc);

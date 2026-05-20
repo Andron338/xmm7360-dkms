@@ -17,8 +17,6 @@ RPC_SRCS := \
 
 # Needed by xmm_rpc.c
 LDFLAGS += $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
-LDFLAGS += $(shell pkg-config --libs libnm 2>/dev/null)
-CFLAGS  += $(shell pkg-config --cflags libnm 2>/dev/null)
 
 BINS := test_proto test_rpc
 
@@ -34,7 +32,7 @@ test_proto: test_proto.c test_framework.h ../rpc/xmm_proto.c ../rpc/xmm_proto.h
 test_rpc: test_rpc.c test_framework.h $(RPC_SRCS) \
           ../rpc/xmm_rpc.h ../rpc/xmm_rpc_ids.h ../rpc/xmm_unsol.h
 	$(CC) $(CFLAGS) -o $@ test_rpc.c $(RPC_SRCS) \
-	    ../rpc/xmm_netlink.c ../rpc/xmm_nm.c \
+	    ../rpc/xmm_netlink.c \
 	    $(LDFLAGS) -luuid
 
 test: $(BINS)

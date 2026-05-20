@@ -225,6 +225,7 @@ struct xmm_dev {
 
 	/* Kernel-level error recovery (option 4) */
 	struct work_struct recovery_work;
+	struct work_struct rebuild_work;
 	unsigned long      last_recovery_jiffies;
 	int                recovery_count;
 
@@ -1352,6 +1353,7 @@ static void xmm7360_remove(struct pci_dev *dev)
 	del_timer_sync(&xmm->watchdog);
 #endif
 	cancel_work_sync(&xmm->recovery_work);
+	cancel_work_sync(&xmm->rebuild_work);
 
 	xmm7360_dev_deinit(xmm);
 
@@ -1472,20 +1474,22 @@ static void xmm7360_tty_port_shutdown(struct tty_port *tport)
 	 * If this AT port carried a real session (pppd/MM moved data), the
 	 * modem firmware needs an AT+CFUN cycle before the next ATD*99# will
 	 * succeed — otherwise it stays wedged and reconnect fails. Emit a
-	 * uevent so udev runs a fast mmcli --disable/--enable. Gate on
-	 * tx_bytes so a bare probe-open does not cycle the modem needlessly.
+	 * in-kernel rebuild so the next connect is clean. Gate on tx_bytes so
+	 * a bare probe-open does not rebuild the modem needlessly.
 	 */
 	if (had_session && qp->xmm && !qp->xmm->error) {
 		struct xmm_dev *xmm = qp->xmm;
 		qp->tx_bytes = 0;
 		qp->rx_bytes = 0;
-		/* Coalesce: several AT QPs tear down together on one PPP
-		 * disconnect — emit at most one uevent per 5s so we trigger a
-		 * single modem cycle, not five. */
+		/* A PPP session just ended. Rebuild the device in place (same as
+		 * boot) so the firmware is clean for the next connect. Several AT
+		 * QPs tear down together, so coalesce to one rebuild per 5s.
+		 * Deferred to a workqueue — we are inside the TTY close path here
+		 * and must not tear down the port synchronously. */
 		if (!xmm->last_disconnect_jiffies ||
 		    time_after(jiffies, xmm->last_disconnect_jiffies + 5 * HZ)) {
 			xmm->last_disconnect_jiffies = jiffies;
-			xmm7360_emit_uevent(xmm, "disconnected");
+			schedule_work(&xmm->rebuild_work);
 		}
 	}
 }
@@ -1759,6 +1763,77 @@ rearm:
  * give up and leave xmm->error set so userspace (xmm7360-watch +
  * xmm7360-recovery.service) handles it via module reload.
  */
+/*
+ * xmm7360_do_rebuild - tear the device down and recreate it in place.
+ *
+ * This is the in-kernel equivalent of `modprobe -r xmm7360 && modprobe
+ * xmm7360` minus unloading the .ko: it destroys wwan0/ttyXMM*/cdevs +
+ * DMA rings, re-handshakes the firmware, and recreates everything just
+ * like a fresh probe. Callers must NOT hold tty/rtnl locks (runs from a
+ * workqueue). Returns 0 on success, negative on failure (device left
+ * in error state).
+ */
+static int xmm7360_do_rebuild(struct xmm_dev *xmm)
+{
+	int ret;
+
+	/* Silence the IRQ source so the handler cannot race with dev_deinit
+	 * freeing cp/td_ring/qp/netdev. disable_irq() waits for any in-flight
+	 * IRQ to finish, then masks the line. */
+	if (xmm->irq)
+		disable_irq(xmm->irq);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
+	timer_delete_sync(&xmm->watchdog);
+#else
+	del_timer_sync(&xmm->watchdog);
+#endif
+
+	xmm7360_dev_deinit(xmm);
+	msleep(100);            /* let DMA settle */
+	xmm->error = 0;
+
+	ret = xmm7360_dev_init(xmm);
+	if (ret < 0) {
+		xmm7360_set_error(xmm, -ENODEV);
+		if (xmm->irq)
+			enable_irq(xmm->irq);
+		return ret;
+	}
+
+	if (xmm->irq)
+		enable_irq(xmm->irq);
+	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
+	return 0;
+}
+
+/*
+ * xmm7360_rebuild_work - disconnect-triggered rebuild.
+ *
+ * Scheduled from the TTY shutdown path when a PPP session ends. Unlike
+ * recovery_work this is NOT a crash path, so it has no 3-strike budget —
+ * a clean disconnect should always get a clean rebuild. Light rate-limit
+ * (handled by the caller via last_disconnect_jiffies) prevents thrashing.
+ */
+static void xmm7360_rebuild_work(struct work_struct *work)
+{
+	struct xmm_dev *xmm = container_of(work, struct xmm_dev, rebuild_work);
+	int ret;
+
+	dev_info(xmm->dev, "post-disconnect rebuild\n");
+	ret = xmm7360_do_rebuild(xmm);
+	if (ret < 0) {
+		dev_err(xmm->dev,
+			"post-disconnect rebuild failed (%d) — module reload needed\n",
+			ret);
+		xmm7360_emit_uevent(xmm, "failed");
+		return;
+	}
+	dev_info(xmm->dev, "post-disconnect rebuild complete\n");
+	/* MM must re-probe the recreated devices */
+	xmm7360_emit_uevent(xmm, "recovered");
+}
+
 static void xmm7360_recovery_work(struct work_struct *work)
 {
 	struct xmm_dev *xmm = container_of(work, struct xmm_dev, recovery_work);
@@ -1789,46 +1864,14 @@ static void xmm7360_recovery_work(struct work_struct *work)
 	dev_info(xmm->dev, "kernel-level recovery (attempt %d/3)\n",
 		 xmm->recovery_count);
 
-	/* CRITICAL: silence the IRQ source so the handler does not race
-	 * with dev_deinit freeing cp/td_ring/qp/netdev. disable_irq() blocks
-	 * until any in-flight IRQ completes, then masks the line. */
-	if (xmm->irq)
-		disable_irq(xmm->irq);
-
-	/* Stop the watchdog so it does not fire on half-built state */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,18,0)
-	timer_delete_sync(&xmm->watchdog);
-#else
-	del_timer_sync(&xmm->watchdog);
-#endif
-
-	/* Tear down everything (netdev, ttys, cdevs, DMA rings) */
-	xmm7360_dev_deinit(xmm);
-
-	/* Give the modem firmware a moment to settle after DMA stop */
-	msleep(100);
-
-	/* Clear error so dev_init can proceed */
-	xmm->error = 0;
-
-	/* Re-handshake with firmware and recreate all interfaces */
-	ret = xmm7360_dev_init(xmm);
+	ret = xmm7360_do_rebuild(xmm);
 	if (ret < 0) {
 		dev_err(xmm->dev,
 			"kernel recovery dev_init failed (%d) — module reload needed\n",
 			ret);
-		xmm7360_set_error(xmm, -ENODEV);
-		/* Re-enable IRQ so future remove() can run cleanly */
-		if (xmm->irq)
-			enable_irq(xmm->irq);
 		xmm7360_emit_uevent(xmm, "failed");
 		return;
 	}
-
-	/* Re-enable IRQ and re-arm watchdog before returning to normal ops */
-	if (xmm->irq)
-		enable_irq(xmm->irq);
-	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
 
 	dev_info(xmm->dev, "kernel-level recovery complete\n");
 
@@ -1894,6 +1937,7 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	init_waitqueue_head(&xmm->wq);
 	INIT_WORK(&xmm->init_work, xmm7360_dev_init_work);
 	INIT_WORK(&xmm->recovery_work, xmm7360_recovery_work);
+	INIT_WORK(&xmm->rebuild_work, xmm7360_rebuild_work);
 	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
 	timer_setup(&xmm->watchdog, xmm7360_watchdog, 0);
 	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);

@@ -11,7 +11,6 @@ license=('GPL2')
 
 depends=(
     'dkms'
-    'libnm'
     'openssl'
     'util-linux-libs'
     'networkmanager'
@@ -74,10 +73,6 @@ package() {
     # ── Last-resort module reload (triggered by kernel uevent) ───────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
-
-    # ── Post-disconnect modem cycle (triggered by kernel uevent) ─────────
-    install -Dm644 "$_src/xmm7360-cleanup.service" \
-        "${pkgdir}/usr/lib/systemd/system/xmm7360-cleanup.service"
 
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
     install -Dm644 "$_src/xmm7360-modprobe.conf" \

@@ -16,7 +16,6 @@ open_xdatachannel \- initialise and configure the Intel XMM7360 LTE modem
 .RB [ \-t
 .IR seconds ]
 .RB [ \-r ]
-.RB [ \-d ]
 .RB [ \-c
 .IR file ]
 .
@@ -80,11 +79,6 @@ Default:
 .B \-r ", \-\-noresolv"
 Do not append modem-provided DNS servers to
 .IR /etc/resolv.conf .
-.TP
-.B \-d ", \-\-dbus"
-Activate the connection via NetworkManager after configuring the
-interface.  Requires
-.BR libnm .
 .TP
 .BI \-c " file" ", \-\-conf " file
 Read configuration from
