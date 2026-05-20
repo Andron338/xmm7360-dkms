@@ -2,7 +2,6 @@
 Description=XMM7360 Modem RPC Initialisation
 After=dev-ttyXMM1.device
 Before=ModemManager.service
-ConditionPathExists=!/run/xmm7360-init.done
 
 [Service]
 Type=oneshot
@@ -14,7 +13,11 @@ ExecStart=/usr/bin/open_xdatachannel --init-only
 
 ExecStartPost=/usr/bin/touch /run/xmm7360-init.done
 
-# Retry signal setup until MM actually has the modem — no fixed delays
+# The radio is now awake via RPC. Force ModemManager to (re)scan so it
+# finds the modem even if it already probed and gave up before init ran.
+ExecStartPost=-/usr/bin/mmcli -S
+
+# Then retry signal setup until MM actually has the modem — no fixed delays
 ExecStartPost=/bin/sh -c '\
     for i in $(seq 1 30); do \
         mmcli -m 0 --signal-setup=5 2>/dev/null && break; \

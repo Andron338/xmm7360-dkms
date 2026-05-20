@@ -8,9 +8,13 @@ ACTION=="add", SUBSYSTEM=="pci", \
 # Tag ttyXMM AT ports for the Fibocom MM plugin (signal, registration)
 SUBSYSTEM=="tty", KERNEL=="ttyXMM*", ENV{ID_MM_FIBOCOM_TAGGED}="1"
 
-# Trigger xmm7360-init.service when the first AT port appears (boot path)
+# Trigger xmm7360-init.service when the first AT port appears.
+# Use restart (not SYSTEMD_WANTS) so it re-runs on every fresh tty-add —
+# a oneshot+RemainAfterExit service would otherwise refuse to re-run
+# after a manual modprobe, leaving MM without the RPC wake.
 SUBSYSTEM=="tty", KERNEL=="ttyXMM1", ACTION=="add", \
-    TAG+="systemd", ENV{SYSTEMD_WANTS}="xmm7360-init.service"
+    TAG+="systemd", \
+    RUN+="/usr/bin/systemctl restart --no-block xmm7360-init.service"
 
 # ── Kernel-driven recovery via uevent ────────────────────────────────────
 # The module emits CHANGE uevents with XMM7360_STATE=<state>.
