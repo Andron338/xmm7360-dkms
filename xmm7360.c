@@ -1462,8 +1462,23 @@ static int xmm7360_tty_port_activate(struct tty_port *tport,
 static void xmm7360_tty_port_shutdown(struct tty_port *tport)
 {
 	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
+	bool had_session = qp->tx_bytes > 0;
+
 	xmm7360_qp_stop(qp);
 	qp->tty_needs_wake = 0;
+
+	/*
+	 * If this AT port carried a real session (pppd/MM moved data), the
+	 * modem firmware needs an AT+CFUN cycle before the next ATD*99# will
+	 * succeed — otherwise it stays wedged and reconnect fails. Emit a
+	 * uevent so udev runs a fast mmcli --disable/--enable. Gate on
+	 * tx_bytes so a bare probe-open does not cycle the modem needlessly.
+	 */
+	if (had_session && qp->xmm && !qp->xmm->error) {
+		qp->tx_bytes = 0;
+		qp->rx_bytes = 0;
+		xmm7360_emit_uevent(qp->xmm, "disconnected");
+	}
 }
 
 /*

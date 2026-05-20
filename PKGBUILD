@@ -2,7 +2,7 @@
 # AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
 pkgname=xmm7360-dkms-git
-pkgver=r286.g6b666f7   # updated by pkgver() below
+pkgver=r293.gd3853ae   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
@@ -74,6 +74,10 @@ package() {
     # ── Last-resort module reload (triggered by kernel uevent) ───────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-recovery.service"
+
+    # ── Post-disconnect modem cycle (triggered by kernel uevent) ─────────
+    install -Dm644 "$_src/xmm7360-cleanup.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-cleanup.service"
 
     # ── modprobe config (blacklist iosm) ─────────────────────────────────
     install -Dm644 "$_src/xmm7360-modprobe.conf" \

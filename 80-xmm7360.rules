@@ -28,6 +28,13 @@ ACTION=="change", SUBSYSTEM=="pci", \
     ENV{XMM7360_STATE}=="resumed", \
     RUN+="/usr/bin/systemctl restart xmm7360-init.service"
 
+# After a PPP session tears down, cycle the modem so the firmware is
+# clean for the next connect (prevents "won't reconnect" wedge).
+ACTION=="change", SUBSYSTEM=="pci", \
+    ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
+    ENV{XMM7360_STATE}=="disconnected", \
+    TAG+="systemd", ENV{SYSTEMD_WANTS}="xmm7360-cleanup.service"
+
 # After kernel-level recovery rebuilds the devices, re-run RPC init
 # and force ModemManager to re-scan (it lost the old modem object).
 ACTION=="change", SUBSYSTEM=="pci", \
