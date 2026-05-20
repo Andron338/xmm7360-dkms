@@ -2,7 +2,7 @@
 # AUR: https://aur.archlinux.org/packages/xmm7360-dkms-git
 
 pkgname=xmm7360-dkms-git
-pkgver=r299.gc619063   # updated by pkgver() below
+pkgver=r293.gd3853ae   # updated by pkgver() below
 pkgrel=1
 pkgdesc="Intel XMM7360 / Fibocom L850 LTE modem driver (DKMS) with RPC init tool"
 arch=('x86_64')
@@ -69,6 +69,8 @@ package() {
     # ── Boot-time RPC init (triggered by udev when ttyXMM1 appears) ──────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
+    install -Dm644 "$_src/xmm7360-signal.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-signal.service"
 
     # ── Last-resort module reload (triggered by kernel uevent) ───────────
     install -Dm644 "$_src/xmm7360-recovery.service" \

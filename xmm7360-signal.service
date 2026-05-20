@@ -1,0 +1,26 @@
+[Unit]
+Description=XMM7360 signal-quality polling setup
+# Runs AFTER ModemManager is up (unlike init.service which wakes the radio
+# before MM). Enables periodic signal reporting once MM has the modem.
+After=ModemManager.service xmm7360-init.service
+Wants=ModemManager.service
+ConditionPathExists=/run/xmm7360-init.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Wait for MM to actually have the modem, then enable signal polling.
+# MM is on the bus now (we run After it), so mmcli works here.
+ExecStart=/bin/sh -c '\
+    for i in $(seq 1 30); do \
+        mmcli -m 0 --signal-setup=5 2>/dev/null && exit 0; \
+        sleep 1; \
+    done; \
+    exit 0'
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

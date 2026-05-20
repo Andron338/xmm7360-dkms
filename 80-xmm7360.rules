@@ -30,12 +30,14 @@ ACTION=="change", SUBSYSTEM=="pci", \
 ACTION=="change", SUBSYSTEM=="pci", \
     ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
     ENV{XMM7360_STATE}=="resumed", \
-    RUN+="/usr/bin/systemctl restart xmm7360-init.service"
+    RUN+="/usr/bin/systemctl restart --no-block xmm7360-init.service", \
+    RUN+="/usr/bin/systemctl restart --no-block xmm7360-signal.service"
 
 # After kernel-level recovery rebuilds the devices, re-run RPC init
 # and force ModemManager to re-scan (it lost the old modem object).
 ACTION=="change", SUBSYSTEM=="pci", \
     ATTR{vendor}=="0x8086", ATTR{device}=="0x7360", \
     ENV{XMM7360_STATE}=="recovered", \
-    RUN+="/usr/bin/systemctl restart xmm7360-init.service", \
-    RUN+="/usr/bin/mmcli -S"
+    RUN+="/usr/bin/systemctl restart --no-block xmm7360-init.service", \
+    RUN+="/usr/bin/mmcli -S", \
+    RUN+="/usr/bin/systemctl restart --no-block xmm7360-signal.service"

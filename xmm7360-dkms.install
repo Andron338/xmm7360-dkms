@@ -18,10 +18,10 @@ post_install() {
     systemctl unmask NetworkManager-dispatcher.service 2>/dev/null || true
     systemctl enable --now NetworkManager-dispatcher.service 2>/dev/null || true
 
-    echo ">>> Enabling xmm7360-init.service..."
+    echo ">>> Enabling xmm7360 services..."
     systemctl daemon-reload
     systemctl enable xmm7360-init.service
-    systemctl enable --now xmm7360-watch.service
+    systemctl enable xmm7360-signal.service
 
     echo ""
     echo ">>> NOTE: iosm is now blacklisted. A reboot is needed for xmm7360"
@@ -48,8 +48,8 @@ pre_remove() {
     local ver
     ver=$(ls /usr/src | grep "^${_pkgname}-" | sort -V | tail -1 | sed "s/${_pkgname}-//")
 
-    systemctl disable xmm7360-watch.service 2>/dev/null || true
-    systemctl stop    xmm7360-watch.service 2>/dev/null || true
+    systemctl disable xmm7360-signal.service 2>/dev/null || true
+    systemctl stop    xmm7360-signal.service 2>/dev/null || true
 
     echo ">>> Removing xmm7360 ${ver} from DKMS..."
     dkms remove "${_pkgname}/${ver}" --all --no-depmod 2>/dev/null || true
@@ -60,7 +60,6 @@ pre_remove() {
     echo ">>> Unloading xmm7360 module..."
     modprobe -r xmm7360 2>/dev/null || true
 
-    rm -f /usr/lib/systemd/system-sleep/xmm7360
 
     echo ">>> NOTE: iosm blacklist removed. Reboot to restore iosm."
 }
