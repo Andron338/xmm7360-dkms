@@ -225,7 +225,6 @@ struct xmm_dev {
 
 	/* Kernel-level error recovery (option 4) */
 	struct work_struct recovery_work;
-	struct work_struct rebuild_work;
 	unsigned long      last_recovery_jiffies;
 	int                recovery_count;
 
@@ -234,7 +233,6 @@ struct xmm_dev {
 	unsigned long      wd_last_tx_bytes;
 	unsigned long      wd_last_rx_bytes;
 	int                wd_stall_count;
-	unsigned long      last_disconnect_jiffies;
 
 	volatile struct control_page *cp;
 	dma_addr_t cp_phys;
@@ -1353,7 +1351,6 @@ static void xmm7360_remove(struct pci_dev *dev)
 	del_timer_sync(&xmm->watchdog);
 #endif
 	cancel_work_sync(&xmm->recovery_work);
-	cancel_work_sync(&xmm->rebuild_work);
 
 	xmm7360_dev_deinit(xmm);
 
@@ -1465,33 +1462,9 @@ static int xmm7360_tty_port_activate(struct tty_port *tport,
 static void xmm7360_tty_port_shutdown(struct tty_port *tport)
 {
 	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
-	bool had_session = qp->tx_bytes > 0;
 
 	xmm7360_qp_stop(qp);
 	qp->tty_needs_wake = 0;
-
-	/*
-	 * If this AT port carried a real session (pppd/MM moved data), the
-	 * modem firmware needs an AT+CFUN cycle before the next ATD*99# will
-	 * succeed — otherwise it stays wedged and reconnect fails. Emit a
-	 * in-kernel rebuild so the next connect is clean. Gate on tx_bytes so
-	 * a bare probe-open does not rebuild the modem needlessly.
-	 */
-	if (had_session && qp->xmm && !qp->xmm->error) {
-		struct xmm_dev *xmm = qp->xmm;
-		qp->tx_bytes = 0;
-		qp->rx_bytes = 0;
-		/* A PPP session just ended. Rebuild the device in place (same as
-		 * boot) so the firmware is clean for the next connect. Several AT
-		 * QPs tear down together, so coalesce to one rebuild per 5s.
-		 * Deferred to a workqueue — we are inside the TTY close path here
-		 * and must not tear down the port synchronously. */
-		if (!xmm->last_disconnect_jiffies ||
-		    time_after(jiffies, xmm->last_disconnect_jiffies + 5 * HZ)) {
-			xmm->last_disconnect_jiffies = jiffies;
-			schedule_work(&xmm->rebuild_work);
-		}
-	}
 }
 
 /*
@@ -1807,33 +1780,6 @@ static int xmm7360_do_rebuild(struct xmm_dev *xmm)
 	return 0;
 }
 
-/*
- * xmm7360_rebuild_work - disconnect-triggered rebuild.
- *
- * Scheduled from the TTY shutdown path when a PPP session ends. Unlike
- * recovery_work this is NOT a crash path, so it has no 3-strike budget —
- * a clean disconnect should always get a clean rebuild. Light rate-limit
- * (handled by the caller via last_disconnect_jiffies) prevents thrashing.
- */
-static void xmm7360_rebuild_work(struct work_struct *work)
-{
-	struct xmm_dev *xmm = container_of(work, struct xmm_dev, rebuild_work);
-	int ret;
-
-	dev_info(xmm->dev, "post-disconnect rebuild\n");
-	ret = xmm7360_do_rebuild(xmm);
-	if (ret < 0) {
-		dev_err(xmm->dev,
-			"post-disconnect rebuild failed (%d) — module reload needed\n",
-			ret);
-		xmm7360_emit_uevent(xmm, "failed");
-		return;
-	}
-	dev_info(xmm->dev, "post-disconnect rebuild complete\n");
-	/* MM must re-probe the recreated devices */
-	xmm7360_emit_uevent(xmm, "recovered");
-}
-
 static void xmm7360_recovery_work(struct work_struct *work)
 {
 	struct xmm_dev *xmm = container_of(work, struct xmm_dev, recovery_work);
@@ -1937,7 +1883,6 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	init_waitqueue_head(&xmm->wq);
 	INIT_WORK(&xmm->init_work, xmm7360_dev_init_work);
 	INIT_WORK(&xmm->recovery_work, xmm7360_recovery_work);
-	INIT_WORK(&xmm->rebuild_work, xmm7360_rebuild_work);
 	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
 	timer_setup(&xmm->watchdog, xmm7360_watchdog, 0);
 	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
