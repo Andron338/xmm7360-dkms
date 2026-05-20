@@ -66,6 +66,10 @@ package() {
     install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
+    # ── NetworkManager dispatcher: auto-rescan MM when modem drops ───────
+    install -Dm755 "$_src/30-xmm7360-rescan" \
+        "${pkgdir}/etc/NetworkManager/dispatcher.d/30-xmm7360-rescan"
+
     # ── Boot-time RPC init (triggered by udev when ttyXMM1 appears) ──────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"

@@ -1,0 +1,40 @@
+#!/bin/bash
+# /etc/NetworkManager/dispatcher.d/30-xmm7360-rescan
+#
+# When the LTE modem connection goes down (or the device disconnects),
+# ModemManager often drops the XMM7360 modem object and does not re-probe
+# on its own — `mmcli -L` then shows "No modems were found" until something
+# forces a rescan. This dispatcher runs that rescan automatically.
+#
+# Safe by construction: it only ever calls `mmcli -S` (a D-Bus request to
+# ModemManager to scan). It never touches the kernel module or device nodes,
+# so it cannot deadlock or freeze the system.
+#
+# NetworkManager calls dispatcher scripts as: <interface> <action>
+
+interface="$1"
+action="$2"
+
+log() { logger -t xmm7360-rescan "$*"; }
+
+# React to the modem going away. ttyXMM2 is the PPP/AT interface NM uses.
+case "$action" in
+    down|vpn-down|connectivity-change|pre-down)
+        # Only act when MM has actually lost the modem — avoids needless scans
+        if ! mmcli -L 2>/dev/null | grep -q '/Modem/'; then
+            log "modem missing after '$action' on '$interface' — requesting rescan"
+            # Retry: MM's probe takes several seconds; give it a few tries.
+            for i in 1 2 3 4 5; do
+                mmcli -S 2>/dev/null || true
+                sleep 3
+                if mmcli -L 2>/dev/null | grep -q '/Modem/'; then
+                    log "modem reappeared after rescan (attempt $i)"
+                    exit 0
+                fi
+            done
+            log "modem still absent after 5 rescan attempts"
+        fi
+        ;;
+esac
+
+exit 0
