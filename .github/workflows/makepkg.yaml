@@ -1,0 +1,189 @@
+name: Arch PKGBUILD CI
+
+# Two stages:
+#   1. package — build + lint the Arch package once from the LOCAL checkout
+#      (not the GitHub remote), so CI tests exactly what you committed. The
+#      package() step only assembles files; it does NOT compile the module
+#      (DKMS does that at install time), so there's no point building the
+#      package once per kernel.
+#   2. dkms-build — THIS is the per-kernel test: take the packaged module
+#      source and compile it the way DKMS will, against each kernel's headers.
+#         linux, linux-lts, linux-zen, linux-hardened → official (required)
+#         linux-rt                                     → AUR (best-effort)
+
+on:
+  push:
+    paths:
+      - 'PKGBUILD'
+      - 'dkms.conf'
+      - 'Makefile.dkms'
+      - 'Makefile.tool'
+      - '*.install'
+      - 'rpc/**'
+      - 'xmm7360.c'
+      - '.github/workflows/makepkg.yaml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ── Stage 1: build + lint the package once ──────────────────────────────
+  package:
+    name: makepkg + namcap
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # pkgver() needs git history
+
+      - name: Install deps
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git namcap pkgconf openssl util-linux \
+            modemmanager networkmanager psmisc dkms
+
+      - name: Prepare builder + local source
+        run: |
+          useradd -m builder
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder:builder /home/builder/src
+          sudo -u builder git config --global --add safe.directory /home/builder/src
+
+      - name: Point PKGBUILD at the local checkout
+        run: |
+          cd /home/builder/src
+          # makepkg uses the last assignment, so a trailing override wins.
+          sudo -u builder tee -a PKGBUILD >/dev/null <<'OVERRIDE'
+
+          # ── CI override: build from local checkout ──
+          source=("xmm7360-pci::git+file:///home/builder/src")
+          sha256sums=('SKIP')
+          OVERRIDE
+
+      - name: namcap PKGBUILD
+        run: |
+          cd /home/builder/src
+          namcap PKGBUILD 2>&1 | tee namcap.log || true
+          if grep -E '^PKGBUILD.* E: ' namcap.log; then
+            echo "::error::namcap reported errors"; exit 1
+          fi
+
+      - name: shellcheck install hooks + scripts
+        run: |
+          pacman -S --noconfirm --needed shellcheck
+          cd /home/builder/src
+          for f in *.install xmm7360-reset; do
+            [ -f "$f" ] || continue
+            echo "── $f ──"; shellcheck -s bash -S warning "$f" || true
+          done
+
+      - name: makepkg (assemble package)
+        run: |
+          cd /home/builder/src
+          sudo -u builder makepkg -sf --noconfirm --nocheck 2>&1 | tee makepkg.log
+          ls -la *.pkg.tar.* || { echo "::error::no package produced"; exit 1; }
+
+      - name: Inspect package contents
+        run: |
+          cd /home/builder/src
+          for p in *.pkg.tar.*; do
+            echo "=== $p ==="
+            tar -tf "$p" | grep -vE '^\.(MTREE|PKGINFO|BUILDINFO)$' | sort
+          done
+
+      - name: Upload package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: |
+            /home/builder/src/*.pkg.tar.*
+            /home/builder/src/*.log
+          retention-days: 14
+
+  # ── Stage 2: compile the packaged module against each kernel ────────────
+  dkms-build:
+    name: dkms build (${{ matrix.kernel }})
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [linux, linux-lts, linux-zen, linux-hardened]
+        include:
+          - kernel: linux-rt
+            experimental: true
+
+    env:
+      KPKG: ${{ matrix.kernel }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Base tooling
+        run: |
+          pacman -Syu --noconfirm --needed base-devel bc kmod git sudo
+
+      - name: Install kernel headers
+        run: |
+          if [ "$KPKG" = "linux-rt" ]; then
+            useradd -m builder
+            echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+            chmod 0440 /etc/sudoers.d/builder
+            sudo -u builder bash -c '
+              cd /home/builder
+              git clone --depth 1 https://aur.archlinux.org/linux-rt.git
+              cd linux-rt && makepkg -s --noconfirm --nocheck
+            '
+            pacman -U --noconfirm /home/builder/linux-rt/*headers*.pkg.tar.*
+          else
+            pacman -S --noconfirm --needed "${KPKG}-headers"
+          fi
+
+      - name: Resolve kernel version dir
+        id: kver
+        run: |
+          case "$KPKG" in
+            linux)          tag='' ;;
+            linux-lts)      tag='-lts' ;;
+            linux-zen)      tag='-zen' ;;
+            linux-hardened) tag='-hardened' ;;
+            linux-rt)       tag='-rt' ;;
+          esac
+          if [ -z "$tag" ]; then
+            KVER=$(ls -1 /usr/lib/modules/ | grep -E '^[0-9].*-arch' | sort -V | tail -1)
+          else
+            KVER=$(ls -1 /usr/lib/modules/ | grep -- "$tag" | sort -V | tail -1)
+          fi
+          if [ -z "$KVER" ] || [ ! -d "/usr/lib/modules/$KVER/build" ]; then
+            echo "::error::no usable headers for $KPKG"; ls -la /usr/lib/modules/ || true; exit 1
+          fi
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
+
+      - name: Build packaged module the DKMS way
+        run: |
+          # Reproduce exactly what DKMS does: build with Makefile.dkms against
+          # the target kernel. This validates dkms.conf's MAKE line will work.
+          cp Makefile.dkms /tmp/Kbuild-test || true
+          make -f Makefile.dkms KERNELRELEASE=${{ steps.kver.outputs.kver }} 2>&1 \
+            | tee dkms-build.log
+          test -f xmm7360.ko || { echo "::error::module did not build under DKMS rules"; exit 1; }
+          modinfo xmm7360.ko | grep -q 'license:.*GPL'
+
+      - name: Upload module
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dkms-module-${{ matrix.kernel }}
+          path: |
+            xmm7360.ko
+            dkms-build.log
+          retention-days: 14
