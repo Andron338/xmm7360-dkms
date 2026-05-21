@@ -1,20 +1,61 @@
 name: Publish to AUR
+
+# Fires whenever the packaging files change on master (and on manual dispatch).
+#
+# IMPORTANT: a previous version combined `tags: [v*]` with `paths: [PKGBUILD]`.
+# GitHub ignores `paths:` filters on tag pushes, so that workflow only ran on
+# v* tags and silently skipped ordinary PKGBUILD commits — which let the AUR
+# copy drift out of sync with the repo. Triggering on branch pushes that touch
+# the packaging files keeps AUR and GitHub aligned automatically.
+
 on:
   push:
-    tags: [ 'v*' ]
-    paths: [ 'PKGBUILD' ]
+    branches: [ master ]
+    paths:
+      - 'PKGBUILD'
+      - '.SRCINFO'
+      - 'xmm7360-dkms.install'
   workflow_dispatch:
+
 jobs:
   publish:
+    name: Push package to AUR
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # pkgver() needs full git history for .SRCINFO
+
+      - name: Validate PKGBUILD references resolve to repo paths
+        run: |
+          # Cheap guard against the rpc/ -> tool/ class of drift: every $_src
+          # path referenced in package() must exist in the repo.
+          missing=0
+          while read -r p; do
+            rel="${p#\$_src/}"
+            # skip the built binary (produced during build(), not in the repo)
+            [ "$rel" = "tool/open_xdatachannel" ] && continue
+            if [ ! -e "$rel" ]; then
+              echo "::error::PKGBUILD references missing path: $rel"
+              missing=1
+            fi
+          done < <(grep -oE '\$_src/[A-Za-z0-9._/-]+' PKGBUILD | sort -u)
+          for d in tool kernel; do
+            [ -d "$d" ] || { echo "::error::expected dir '$d' missing"; missing=1; }
+          done
+          [ "$missing" = 0 ] || exit 1
+          echo "All PKGBUILD paths resolve."
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
         with:
           pkgname: xmm7360-dkms-git
           pkgbuild: ./PKGBUILD
+          assets: |
+            ./xmm7360-dkms.install
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
-          commit_message: "Update from ${{ github.ref_name }}"
+          commit_message: "Sync from ${{ github.repository }}@${{ github.sha }}"
           ssh_keyscan_types: rsa,ecdsa,ed25519

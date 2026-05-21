@@ -8,9 +8,9 @@
  */
 
 #include "test_framework.h"
-#include "../rpc/xmm_rpc.h"
-#include "../rpc/xmm_rpc_ids.h"
-#include "../rpc/xmm_unsol.h"
+#include "../tool/xmm_rpc.h"
+#include "../tool/xmm_rpc_ids.h"
+#include "../tool/xmm_unsol.h"
 #include <stdlib.h>
 
 /* ── xmm_msg_t ────────────────────────────────────────────────────────────── */

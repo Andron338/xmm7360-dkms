@@ -8,7 +8,7 @@
  */
 
 #include "test_framework.h"
-#include "../rpc/xmm_proto.h"
+#include "../tool/xmm_proto.h"
 
 /* ── xmm_buf_t ────────────────────────────────────────────────────────────── */
 

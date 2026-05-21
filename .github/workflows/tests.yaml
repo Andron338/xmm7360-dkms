@@ -1,0 +1,162 @@
+name: Tests
+
+# Dedicated test suite for the userspace code. Hardware-free, fast, and run on
+# every push/PR so regressions in the RPC protocol / framing logic are caught
+# immediately. Three layers:
+#   1. unit tests under gcc and clang (catches compiler-specific UB)
+#   2. the same tests under ASan+UBSan (catches memory + undefined behaviour)
+#   3. valgrind leak check (catches leaks ASan can miss in this setup)
+# The kernel KUnit module is build-smoked separately in kernel-module-ci.yaml.
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'tool/**'
+      - 'tests/**'
+      - '.github/workflows/tests.yaml'
+  pull_request:
+    paths:
+      - 'tool/**'
+      - 'tests/**'
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel clang openssl util-linux
+
+      - name: Build + run unit tests
+        working-directory: tests
+        env:
+          CC: ${{ matrix.cc }}
+        run: |
+          make clean
+          make test CC=${{ matrix.cc }} 2>&1 | tee test-${{ matrix.cc }}.log
+          # The harness prints "N tests, N passed, 0 failed"; fail if any failed.
+          if grep -qE '[1-9][0-9]* failed' test-${{ matrix.cc }}.log; then
+            echo "::error::unit tests reported failures"; exit 1
+          fi
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-${{ matrix.cc }}
+          path: tests/test-${{ matrix.cc }}.log
+          retention-days: 14
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed base-devel openssl util-linux
+
+      - name: Build + run under sanitizers
+        working-directory: tests
+        run: |
+          make clean
+          # -O1 keeps sanitizer stacks readable; both detectors on.
+          # Put sanitizer flags in CFLAGS only: both link rules invoke
+          # $(CC) $(CFLAGS), so this covers compile AND link, while the
+          # Makefile keeps its own openssl/uuid libs in LDFLAGS.
+          SAN="-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g"
+          make test \
+            CFLAGS="-std=c11 -Wall -Wextra $SAN -I../tool" \
+            2>&1 | tee test-asan.log
+          if grep -qE 'runtime error|ERROR: AddressSanitizer|[1-9][0-9]* failed' test-asan.log; then
+            echo "::error::sanitizer or test failure"; exit 1
+          fi
+
+      - name: Upload sanitizer log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: asan-log
+          path: tests/test-asan.log
+          retention-days: 14
+
+  valgrind:
+    name: valgrind leak check
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed base-devel openssl util-linux valgrind
+
+      - name: Build + leak-check
+        working-directory: tests
+        run: |
+          make clean
+          make test_proto test_rpc
+          for t in test_proto test_rpc; do
+            echo "── valgrind $t ──"
+            valgrind --error-exitcode=1 --leak-check=full \
+                     --errors-for-leak-kinds=definite "./$t"
+          done
+
+  kunit-smoke:
+    name: KUnit module builds
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kernel headers
+        run: |
+          pacman -Syu --noconfirm --needed base-devel bc linux-headers
+
+      - name: Resolve kernel version
+        id: kver
+        run: |
+          KVER=$(ls -1 /usr/lib/modules/ | grep -E '^[0-9].*-arch' | sort -V | tail -1)
+          [ -n "$KVER" ] || { echo "::error::no headers"; ls /usr/lib/modules; exit 1; }
+          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
+
+      - name: Build KUnit test module
+        run: |
+          # Build-smoke only: confirm the in-kernel KUnit suite compiles against
+          # current headers. Actually running it needs kunit_tool + a VM, which
+          # is out of scope for hardware-free CI.
+          make -C "/usr/lib/modules/${{ steps.kver.outputs.kver }}/build" \
+            M="$PWD/tests" \
+            CONFIG_XMM7360_KUNIT_TEST=m \
+            modules 2>&1 | tee kunit-build.log \
+            || { echo "::warning::KUnit module did not build (non-blocking)"; }
+
+      - name: Upload KUnit build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kunit-build-log
+          path: tests/kunit-build.log
+          retention-days: 14

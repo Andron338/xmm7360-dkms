@@ -16,15 +16,13 @@ name: Kernel Module CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths:
-      - 'xmm7360.c'
-      - 'Makefile'
+      - 'kernel/**'
       - '.github/workflows/kernel-module-ci.yaml'
   pull_request:
     paths:
-      - 'xmm7360.c'
-      - 'Makefile'
+      - 'kernel/**'
   workflow_dispatch:
 
 jobs:
@@ -100,12 +98,12 @@ jobs:
 
       - name: Build module
         run: |
-          make KVERSION=${{ steps.kver.outputs.kver }} 2>&1 | tee build.log
-          test -f xmm7360.ko || { echo "::error::xmm7360.ko not produced"; exit 1; }
+          make -C kernel KVERSION=${{ steps.kver.outputs.kver }} 2>&1 | tee build.log
+          test -f kernel/xmm7360.ko || { echo "::error::xmm7360.ko not produced"; exit 1; }
 
       - name: Validate module metadata
         run: |
-          modinfo xmm7360.ko | tee modinfo.txt
+          modinfo kernel/xmm7360.ko | tee modinfo.txt
           grep -q 'license:.*GPL' modinfo.txt \
             || { echo "::error::module missing GPL license"; exit 1; }
 
@@ -123,7 +121,7 @@ jobs:
         with:
           name: module-${{ matrix.kernel }}
           path: |
-            xmm7360.ko
+            kernel/xmm7360.ko
             build.log
             modinfo.txt
           retention-days: 14

@@ -15,13 +15,9 @@ on:
   push:
     paths:
       - 'PKGBUILD'
-      - 'dkms.conf'
-      - 'Makefile.dkms'
-      - 'Makefile.tool'
+      - 'kernel/**'
+      - 'tool/**'
       - '*.install'
-      - 'rpc/**'
-      - 'xmm7360.c'
-      - '.github/workflows/makepkg.yaml'
   pull_request:
   workflow_dispatch:
 
@@ -172,11 +168,10 @@ jobs:
         run: |
           # Reproduce exactly what DKMS does: build with Makefile.dkms against
           # the target kernel. This validates dkms.conf's MAKE line will work.
-          cp Makefile.dkms /tmp/Kbuild-test || true
-          make -f Makefile.dkms KERNELRELEASE=${{ steps.kver.outputs.kver }} 2>&1 \
+                    make -C kernel -f Makefile.dkms KERNELRELEASE=${{ steps.kver.outputs.kver }} 2>&1 \
             | tee dkms-build.log
-          test -f xmm7360.ko || { echo "::error::module did not build under DKMS rules"; exit 1; }
-          modinfo xmm7360.ko | grep -q 'license:.*GPL'
+          test -f kernel/xmm7360.ko || { echo "::error::module did not build under DKMS rules"; exit 1; }
+          modinfo kernel/xmm7360.ko | grep -q 'license:.*GPL'
 
       - name: Upload module
         if: always()
@@ -184,6 +179,6 @@ jobs:
         with:
           name: dkms-module-${{ matrix.kernel }}
           path: |
-            xmm7360.ko
+            kernel/xmm7360.ko
             dkms-build.log
           retention-days: 14

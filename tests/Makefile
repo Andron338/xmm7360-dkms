@@ -7,18 +7,16 @@
 #   make clean
 
 CC      ?= gcc
-CFLAGS  := -std=c11 -Wall -Wextra -g -O0 -I..
+CFLAGS  := -std=c11 -Wall -Wextra -g -O0 -I../tool
 LDFLAGS :=
 
 # Sources from the rpc/ directory that tests link against
 RPC_SRCS := \
-    ../rpc/xmm_proto.c \
-    ../rpc/xmm_rpc.c
+    ../tool/xmm_proto.c \
+    ../tool/xmm_rpc.c
 
 # Needed by xmm_rpc.c
 LDFLAGS += $(shell pkg-config --libs openssl 2>/dev/null || echo "-lssl -lcrypto")
-LDFLAGS += $(shell pkg-config --libs libnm 2>/dev/null)
-CFLAGS  += $(shell pkg-config --cflags libnm 2>/dev/null)
 
 BINS := test_proto test_rpc
 
@@ -26,13 +24,13 @@ BINS := test_proto test_rpc
 
 all: $(BINS)
 
-test_proto: test_proto.c test_framework.h ../rpc/xmm_proto.c ../rpc/xmm_proto.h
-	$(CC) $(CFLAGS) -o $@ test_proto.c ../rpc/xmm_proto.c $(LDFLAGS)
+test_proto: test_proto.c test_framework.h ../tool/xmm_proto.c ../tool/xmm_proto.h
+	$(CC) $(CFLAGS) -o $@ test_proto.c ../tool/xmm_proto.c
 
 test_rpc: test_rpc.c test_framework.h $(RPC_SRCS) \
-          ../rpc/xmm_rpc.h ../rpc/xmm_rpc_ids.h ../rpc/xmm_unsol.h
+          ../tool/xmm_rpc.h ../tool/xmm_rpc_ids.h ../tool/xmm_unsol.h
 	$(CC) $(CFLAGS) -o $@ test_rpc.c $(RPC_SRCS) \
-	    ../rpc/xmm_netlink.c ../rpc/xmm_nm.c \
+	    ../tool/xmm_netlink.c \
 	    $(LDFLAGS) -luuid
 
 test: $(BINS)

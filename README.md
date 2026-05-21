@@ -72,13 +72,11 @@ manual steps needed.
 
 ```bash
 # Build the kernel module
-make
-sudo make load          # load without installing
+make -C kernel
+sudo make -C kernel load   # load without installing
 
 # Build the RPC tool
-cd rpc
-make -f ../Makefile.tool
-cd ..
+make -C tool
 ```
 
 ### Install
@@ -198,21 +196,31 @@ forces a full module reload as a last resort.
 
 ---
 
-## Files
+## Project layout
 
-| File | Purpose |
+```
+xmm7360-pci/
+├── PKGBUILD / .SRCINFO / xmm7360-dkms.install   Arch packaging (flat for AUR)
+├── kernel/    xmm7360.c, Makefile, Makefile.dkms, dkms.conf
+├── tool/      open_xdatachannel.c, xmm_*.{c,h}, Makefile, man page
+├── tests/     userspace unit tests + KUnit module
+├── systemd/   init / signal / rescan / recovery services
+├── udev/      80-xmm7360.rules
+├── conf/      xmm7360-modprobe.conf (blacklists iosm)
+├── scripts/   xmm7360-reset (manual recovery)
+├── docs/      INSTALLING.md, DEVICES.md
+└── .github/workflows/   CI/CD (see below)
+```
+
+### CI/CD workflows
+
+| Workflow | Purpose |
 |---|---|
-| `xmm7360.c` | Kernel module source |
-| `Makefile` | Manual kernel module build |
-| `Makefile.dkms` | Kernel module Makefile for DKMS |
-| `Makefile.tool` | C tool build |
-| `dkms.conf` | DKMS configuration |
-| `PKGBUILD` | Arch Linux package |
-| `xmm7360-init.service` | RPC wake at boot (before ModemManager) |
-| `xmm7360-signal.service` | signal-quality reporting (after ModemManager) |
-| `xmm7360-rescan.service` | re-scan if MM drops the modem |
-| `xmm7360-recovery.service` | module reload on kernel failure uevent |
-| `xmm7360-reset` | manual recovery script |
+| `tests.yaml` | unit tests (gcc/clang), ASan+UBSan, valgrind, KUnit build |
+| `rpc-tool.yml` | tool build + tests + cppcheck |
+| `kernel-module-ci.yaml` | build `.ko` against 5 kernels |
+| `makepkg.yaml` | build + lint package, DKMS-build per kernel |
+| `aur-publish.yaml` | auto-publish to the AUR on packaging changes |
 | `80-xmm7360.rules` | udev rules |
 | `xmm7360-modprobe.conf` | Blacklists iosm |
 | `xmm7360-dkms.install` | Arch post-install hooks |

@@ -82,16 +82,15 @@ For development or non-Arch systems you can build the pieces directly.
 Kernel module:
 
 ```bash
-make                 # builds xmm7360.ko against the running kernel
-sudo make load       # rmmod iosm/xmm7360, then insmod xmm7360.ko
+make -C kernel              # builds xmm7360.ko against the running kernel
+sudo make -C kernel load    # rmmod iosm/xmm7360, then insmod xmm7360.ko
 ```
 
 Userspace tool:
 
 ```bash
-cd rpc
-make -f ../Makefile.tool      # builds open_xdatachannel (needs openssl, libuuid)
-sudo ./open_xdatachannel --init-only
+make -C tool                  # builds open_xdatachannel (needs openssl, libuuid)
+sudo ./tool/open_xdatachannel --init-only
 ```
 
 `--init-only` performs the RPC handshake (SIM open, RF on, signal reporting)

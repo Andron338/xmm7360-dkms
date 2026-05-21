@@ -6,15 +6,13 @@ name: rpc-tool
 on:
   push:
     paths:
-      - 'rpc/**'
+      - 'tool/**'
       - 'tests/**'
-      - 'Makefile.tool'
       - '.github/workflows/rpc-tool.yml'
   pull_request:
     paths:
-      - 'rpc/**'
+      - 'tool/**'
       - 'tests/**'
-      - 'Makefile.tool'
   workflow_dispatch:
 
 jobs:
@@ -31,20 +29,20 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel pkgconf openssl networkmanager util-linux valgrind
+            base-devel pkgconf openssl util-linux valgrind
 
       - name: Build tool (gcc)
-        working-directory: rpc
+        working-directory: tool
         run: |
-          make -f ../Makefile.tool clean
-          make -f ../Makefile.tool
+          make clean
+          make
           test -x open_xdatachannel || { echo "::error::tool not built"; exit 1; }
 
       - name: Build tool (strict warnings)
-        working-directory: rpc
+        working-directory: tool
         run: |
-          make -f ../Makefile.tool clean
-          make -f ../Makefile.tool CFLAGS="-std=c11 -Wall -Wextra -Werror -O2 $(pkg-config --cflags libnm)"
+          make clean
+          make CFLAGS="-std=c11 -Wall -Wextra -Werror -O2"
 
       - name: Run unit tests
         working-directory: tests
@@ -80,13 +78,13 @@ jobs:
       - name: Install cppcheck
         run: pacman -Syu --noconfirm --needed cppcheck
 
-      - name: Run cppcheck on rpc/
+      - name: Run cppcheck on tool/
         run: |
           # Advisory only — warnings do not fail the build.
           cppcheck --enable=warning,portability,performance \
                    --inline-suppr \
                    --suppress=missingIncludeSystem \
-                   rpc/ 2>&1 | tee cppcheck.log || true
+                   tool/ 2>&1 | tee cppcheck.log || true
 
       - name: Upload cppcheck log
         if: always()
