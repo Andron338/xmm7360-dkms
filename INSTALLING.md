@@ -1,174 +1,164 @@
 # Installing
 
-> Note
->
-> The first time you run `make load`, you will see: `rmmod: ERROR: Module xmm7360 is not currently loaded`.
-> This means the module was not already loaded; which is fine since we're loading it for the first time.
+This is the **C port** of xmm7360-pci: a C kernel module (`xmm7360.c`) plus a
+C userspace RPC tool (`open_xdatachannel`), packaged for Arch Linux with DKMS,
+udev rules and systemd services. There is no Python, no `pyroute2`, no
+`lte.sh`, and no `xmm7360.ini` — those belonged to the original Python driver.
 
-## Dependencies
+Confirmed working on the **Lenovo ThinkPad T14s (Intel)** (Fibocom L850 /
+XMM7360) under Arch Linux, kernels 6.18-lts and 7.x.
 
-- build-essential
-- python3-pyroute2
-- python3-configargparse
+---
 
-## Using managment script
+## Recommended: Arch Linux package (DKMS)
 
-> Only tested on Ubuntu 20.04.
+This builds the kernel module via DKMS (so it rebuilds automatically on kernel
+updates) and installs the udev rules and systemd services that bring the modem
+up at boot and keep it healthy.
 
-```
-$ cp xmm7360.ini.sample xmm7360.ini  # edit at least the apn in the configuration file
-$ sudo ./scripts/lte.sh setup
-$ lte up  # should auto-elevate when run
-```
-
-## Ubuntu 20.04
-
-```
-mkdir ~/tmp/
-cd ~/tmp/
-sudo apt install build-essential python3-pyroute2 python3-configargparse git
-git clone https://github.com/xmm7360/xmm7360-pci.git
+```bash
+git clone https://github.com/Andron338/xmm7360-pci.git
 cd xmm7360-pci
-make && make load
-cp xmm7360.ini.sample xmm7360.ini  # edit at least the apn in the configuration file
-sudo python3 rpc/open_xdatachannel.py
-sudo ip link set wwan0 up
+makepkg -si
 ```
 
-The script should set nameservers from your network providers, but you might have to set your own:
+The package:
 
-```
-echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf
-echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf
-echo "nameserver 9.9.9.9" | sudo tee -a /etc/resolv.conf
-```
-## Arch Linux 7.0
+- installs the module source to `/usr/src` and builds it with DKMS
+- blacklists the in-tree `iosm` driver (so `xmm7360` binds instead)
+- installs `/etc/xmm7360.conf` (set `XMM_APN` for your carrier)
+- enables the boot + recovery services (see **Services** below)
 
-```
-mkdir ~/tmp/
-cd ~/tmp/
-sudo pacman -S python-pyroute python-configargparse git
-git clone https://github.com/xmm7360/xmm7360-pci.git
-cd xmm7360-pci
-make && make load
-cp xmm7360.ini.sample xmm7360.ini  # edit at least the apn in the configuration file
-sudo python3 rpc/open_xdatachannel.py
-sudo ip link set wwan0 up
-```
-Currently running sudo python3 rpc/open_xdatachannel.py after make load after a reboot and a script alone after hibernation is the only way it worked with no other package. It doesnt show up in NetworkManager but once script is finished running wwan0 obtains ip and internet connection is up. Might need an ip link wwan0 up. 
+After install, **reboot** so `xmm7360` loads in place of `iosm`. On the next
+boot the modem initialises automatically and appears in ModemManager /
+NetworkManager — connect to it like any other mobile-broadband connection.
 
-P.S. I was trying everything recently and if steps mentioned above doesnt work or there is no signal check out https://github.com/juhovh/xmm7360_usb.
+Set your APN first if it isn't `internet`:
 
-I was testing different things prior to this and one of them was issuing AT commands below to set FCC lock and usb mode so the modem would work in mbim mode. 
-
-```
-at@nvm:fix_cat_fcclock.fcclock_mode?
-at@nvm:fix_cat_fcclock.fcclock_mode=0
-at@store_nvm(fix_cat_fcclock)
-AT+GTUSBMODE?
-AT+GTUSBMODE=7
-AT+CFUN?
-AT+CFUN=15
-```
-
-# Installing with DKMS
-Using DKMS (https://wiki.archlinux.org/title/Dynamic_Kernel_Module_Support) allows you to automate the **compilation** and **signing** of kernel modules, for example whenever you update your kernel.
-
-DKMS also has many other features, like the auto-generation of `.deb` for a particular kernel. See `man dkms` for more.
-
-## Compiling xmm7360.ko with DKMS
-The following steps replaces the commands from `Installing/Ubuntu 20.04`, up to and including `make && make load`. **Do not run `lte setup`.**
-
-First, install DKMS and other dependencies:
 ```bash
-sudo apt install dkms
-sudo apt install build-essential python3-pyroute2 python3-configargparse git
+sudoedit /etc/xmm7360.conf      # XMM_APN=your.carrier.apn
 ```
 
-Then, install the source code to `/usr/src/`:
+---
+
+## Services
+
+| Service                   | When            | Job                                                        |
+| ------------------------- | --------------- | ---------------------------------------------------------- |
+| `xmm7360-init.service`    | boot, before MM | RPC wake (SIM open, RF on) so ModemManager can detect it   |
+| `xmm7360-signal.service`  | boot, after MM  | enable periodic signal-quality reporting                   |
+| `xmm7360-rescan.service`  | boot (polls)    | re-scan if ModemManager drops the modem after a disconnect |
+| `xmm7360-recovery.service`| udev-triggered  | reload the module if the kernel reports an unrecoverable failure |
+
+A manual escape hatch is also installed:
+
 ```bash
-TMP=$(mktemp -d)
-cd $TMP
-
-# Clone the Repository
-git clone https://github.com/xmm7360/xmm7360-pci.git 
-cd xmm7360-pci
-## For a particular branch/commit, run 'git checkout <REF>' here
-
-# Feed Commit ID as Package Version to dkms.conf
-COMMIT_ID=$(git rev-parse HEAD)
-sed "s/COMMIT_ID_VERSION/$COMMIT_ID/g" dkms.tmpl.conf > dkms.conf
-
-# Install in /usr/src
-sudo cp -r ./ /usr/src/xmm7360-pci-$COMMIT_ID/
+sudo xmm7360-reset      # force a full module reload + MM rescan
 ```
 
-Now, you can use DKMS to automatically build and sign the kernel module for the curent kernel with one simple command:
+---
+
+## Verifying
+
 ```bash
-sudo dkms install xmm7360-pci/$COMMIT_ID
+# kernel side
+sudo dmesg | grep xmm7360            # expect: "modem is ready"
+ls /dev/ttyXMM* /dev/xmm0/*          # device nodes present
+
+# ModemManager side
+mmcli -L                             # modem listed
+mmcli -m 0 | grep -E 'state|signal|operator'   # registered, signal, carrier
 ```
 
-You can now manually load the kernel module with:
+Then connect via NetworkManager (`nmcli` or the GUI) using a mobile-broadband
+(GSM) connection with your APN.
+
+---
+
+## Manual build (no package)
+
+For development or non-Arch systems you can build the pieces directly.
+
+Kernel module:
+
 ```bash
-sudo modprobe xmm7360
+make                 # builds xmm7360.ko against the running kernel
+sudo make load       # rmmod iosm/xmm7360, then insmod xmm7360.ko
 ```
 
-To load the `xmm7360` module automatically on boot, create the following file:
+Userspace tool:
 
-`/etc/modules-load.d/xmm7360.conf`
 ```bash
-xmm7360
+cd rpc
+make -f ../Makefile.tool      # builds open_xdatachannel (needs openssl, libuuid)
+sudo ./open_xdatachannel --init-only
 ```
 
-**Make sure to test your setup before auto-loading the module**.
+`--init-only` performs the RPC handshake (SIM open, RF on, signal reporting)
+and exits, letting ModemManager manage the connection over the AT ports. Full
+data-channel mode (`--apn internet`, raw IP on `wwan0`) exists for use with the
+`iosm` module but is **not** the recommended path here — PPP via ModemManager
+is the supported configuration.
 
-## Running w/DKMS Install
-**Do not run `lte setup`**. Instead, just run `sudo ./scripts/lte.sh up` after loading the kernel module.
+---
 
-# Signing for Secure Boot
-If you use Secure Boot, you'll get `Operation not permitted` when executing `modprobe xmm7360` (ex. through `make load`). This is because Secure Boot requires all kernel code to be signed by a trusted party.
+## Suspend / resume
 
-DKMS can easily manage signing kernel modules for you. All you have to do, is generate the signing keypair, and enroll it into your BIOS.
+Handled in-kernel. On resume the module emits a uevent that re-runs
+initialisation automatically. No manual step and no systemd sleep hook are
+required (earlier revisions needed one; that is no longer the case).
 
-First, you need to get openssl and mokutil.
+---
+
+## Secure Boot signing
+
+If Secure Boot is enabled, unsigned modules fail to load with
+`Operation not permitted`. DKMS can sign the module for you.
+
+Generate a Machine Owner Key and enroll it:
+
 ```bash
-sudo apt install openssl mokutil
-```
+sudo pacman -S --needed openssl mokutil
 
-Next, generate the signing keys into `/root`:
-```bash
 openssl req -new -x509 -newkey rsa:2048 \
--keyout /root/mok.priv \
--outform DER -out /root/mok.der \
--nodes -days 36500 \
--subj "/CN=user Kmod Signing MOK"
-```
+  -keyout /root/mok.priv -outform DER -out /root/mok.der \
+  -nodes -days 36500 -subj "/CN=xmm7360 Module Signing Key"
 
-Enroll the public key into the firmware:
-```
 sudo mokutil --import /root/mok.der
+# reboot — the firmware prompts you to enroll the key
 ```
 
-Now, restart your computer. Your BIOS should prompt you to accept the key, before booting into the system.
+Configure DKMS to sign on build by creating `/etc/dkms/sign_helper.sh`:
 
-**If you use DKMS** you only need to configure DKMS to use the pre-shipped signing tool to sign kernel modules whenever it builds them:
-
-`/etc/dkms/framework.conf`
 ```bash
-...
-## Script to sign modules during build, script is called with kernel version
-## and module name
+#!/bin/sh
+/usr/lib/modules/"$1"/build/scripts/sign-file sha512 /root/mok.priv /root/mok.der "$2"
+```
+
+```bash
+sudo chmod +x /etc/dkms/sign_helper.sh
+```
+
+and pointing DKMS at it in `/etc/dkms/framework.conf`:
+
+```
 sign_tool="/etc/dkms/sign_helper.sh"
 ```
 
-If it for some reason doesn't exist, create it:
+DKMS will then sign `xmm7360.ko` automatically on every (re)build.
 
-`/etc/dkms/sign_helper.sh`
-```bash
-#!/bin/sh
-/lib/modules/"$1"/build/scripts/sign-file sha512 /root/mok.priv /root/mok.der "$2"
-```
+---
 
-**If you don't use DKMS** you can try (untested) running the above script using:
-- `$1 => linux-image-<version>`
-- `$2 => /path/to/xmm7360.ko`
+## Troubleshooting
+
+- **Modem absent after a disconnect/reconnect** — the `xmm7360-rescan` service
+  should re-scan within ~10 s. Force it manually with `sudo mmcli -S` (wait a
+  few seconds, then `mmcli -L`), or `sudo xmm7360-reset` for a full reload.
+- **`iosm` keeps grabbing the device** — confirm the blacklist landed:
+  `cat /usr/lib/modprobe.d/xmm7360.conf` and reboot.
+- **No signal / FCC-locked** — some units ship FCC-locked. Check
+  `mmcli -m 0` for a failed/locked state; if so, an FCC-unlock script may be
+  required (ModemManager ships several under
+  `/usr/share/ModemManager/fcc-unlock.available.d/`).
+- **Other hardware** — if you find a non-USB XMM7360 modem that needs different
+  AT setup, see https://github.com/juhovh/xmm7360_usb for the USB variant.

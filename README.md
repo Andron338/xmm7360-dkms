@@ -3,7 +3,9 @@
 Driver for the **Fibocom L850-GL / Intel XMM7360** LTE modem (PCI ID `8086:7360`),
 with a C userspace RPC tool and full DKMS packaging for Arch Linux.
 
-See [DEVICES.md](DEVICES.md) for a list of tested devices.
+Confirmed working with this C port on the **Lenovo ThinkPad T14s (Intel)**
+(Fibocom L850 / XMM7360) under Arch Linux, kernels 6.18-lts and 7.x.
+See [DEVICES.md](DEVICES.md) for the full list of tested devices.
 
 > ⚠️ _In development. No support provided. May not work, may crash your
 > computer, may singe your jaffles._
@@ -186,19 +188,13 @@ sudo rm /usr/lib/modprobe.d/xmm7360.conf
 
 ## Power management
 
-Power management is not yet supported. The modem loses its state on
-suspend and must be reinitialised on resume. As a workaround, add a
-systemd sleep hook:
+Suspend/resume is handled in-kernel. On resume the module emits a uevent
+that re-runs `xmm7360-init.service` automatically, so the modem returns
+without any manual step or systemd sleep hook.
 
-```bash
-# /usr/lib/systemd/system-sleep/xmm7360-resume.sh
-#!/bin/bash
-[ "$1" = "post" ] && systemctl restart xmm7360-init.service
-```
-
-```bash
-sudo chmod +x /usr/lib/systemd/system-sleep/xmm7360-resume.sh
-```
+If ModemManager ever drops the modem after a disconnect, the
+`xmm7360-rescan.service` re-scans it automatically; `sudo xmm7360-reset`
+forces a full module reload as a last resort.
 
 ---
 
@@ -212,7 +208,11 @@ sudo chmod +x /usr/lib/systemd/system-sleep/xmm7360-resume.sh
 | `Makefile.tool` | C tool build |
 | `dkms.conf` | DKMS configuration |
 | `PKGBUILD` | Arch Linux package |
-| `xmm7360-init.service` | systemd init service |
+| `xmm7360-init.service` | RPC wake at boot (before ModemManager) |
+| `xmm7360-signal.service` | signal-quality reporting (after ModemManager) |
+| `xmm7360-rescan.service` | re-scan if MM drops the modem |
+| `xmm7360-recovery.service` | module reload on kernel failure uevent |
+| `xmm7360-reset` | manual recovery script |
 | `80-xmm7360.rules` | udev rules |
 | `xmm7360-modprobe.conf` | Blacklists iosm |
 | `xmm7360-dkms.install` | Arch post-install hooks |

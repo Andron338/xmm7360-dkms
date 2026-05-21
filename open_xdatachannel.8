@@ -1,4 +1,4 @@
-.TH OPEN_XDATACHANNEL 8 "2025" "xmm7360-pci" "System Administration"
+.TH OPEN_XDATACHANNEL 8 "2026" "xmm7360-pci" "System Administration"
 .
 .SH NAME
 open_xdatachannel \- initialise and configure the Intel XMM7360 LTE modem
@@ -160,8 +160,12 @@ Originally developed as part of the
 project.
 C port and packaging by contributors.
 .
-.SH BUGS
-Power management is not supported.  The modem loses its configuration on
-system suspend and must be reinitialised on resume.  Run
-.B open_xdatachannel \-\-init\-only
-after resume or configure a systemd sleep hook to do so automatically.
+.SH NOTES
+On the
+.B xmm7360
+kernel module, suspend/resume is handled in-kernel: on resume the module
+emits a uevent that re-runs initialisation automatically, so no manual
+step or sleep hook is needed.  If ModemManager loses the modem after a
+disconnect, the
+.B xmm7360\-rescan
+service re-scans it automatically; see the package services.

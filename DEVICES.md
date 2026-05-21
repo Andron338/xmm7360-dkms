@@ -2,6 +2,17 @@
 
 > Please create an issue if this information is incorrect or you have a new device to add!
 
+## Confirmed working with this C port + DKMS package
+
+These are verified with the C `xmm7360.c` kernel module and the
+`open_xdatachannel` RPC tool from this repository (Arch Linux / DKMS),
+as opposed to the original Python driver the table below was built from.
+
+| Device              | Modem                | OS / Kernel                          | Works? | Notes |
+| ------------------- | -------------------- | ------------------------------------ | ------ | ----- |
+| ThinkPad T14s (Intel) | Fibocom L850 / XMM7360 | Arch Linux, kernels 6.18-lts / 7.x | Yes    | PPP via ModemManager + NetworkManager; suspend/resume and auto re-scan working |
+
+
 ## HP
 
 | Device                  | OS           | Works? | Issue Link/Comment                                           |
