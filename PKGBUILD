@@ -58,6 +58,10 @@ package() {
     install -Dm755 "$_src/rpc/open_xdatachannel" \
         "${pkgdir}/usr/bin/open_xdatachannel"
 
+    # Manual recovery tool (escape hatch for total wedge)
+    install -Dm755 "$_src/xmm7360-reset" \
+        "${pkgdir}/usr/bin/xmm7360-reset"
+
     # ── Man page ─────────────────────────────────────────────────────────
     install -Dm644 "$_src/open_xdatachannel.8" \
         "${pkgdir}/usr/share/man/man8/open_xdatachannel.8"
@@ -66,15 +70,14 @@ package() {
     install -Dm644 "$_src/80-xmm7360.rules" \
         "${pkgdir}/usr/lib/udev/rules.d/80-xmm7360.rules"
 
-    # ── NetworkManager dispatcher: auto-rescan MM when modem drops ───────
-    install -Dm755 "$_src/30-xmm7360-rescan" \
-        "${pkgdir}/etc/NetworkManager/dispatcher.d/30-xmm7360-rescan"
 
     # ── Boot-time RPC init (triggered by udev when ttyXMM1 appears) ──────
     install -Dm644 "$_src/xmm7360-init.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-init.service"
     install -Dm644 "$_src/xmm7360-signal.service" \
         "${pkgdir}/usr/lib/systemd/system/xmm7360-signal.service"
+    install -Dm644 "$_src/xmm7360-rescan.service" \
+        "${pkgdir}/usr/lib/systemd/system/xmm7360-rescan.service"
 
     # ── Last-resort module reload (triggered by kernel uevent) ───────────
     install -Dm644 "$_src/xmm7360-recovery.service" \
