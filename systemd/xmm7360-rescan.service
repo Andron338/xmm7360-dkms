@@ -8,20 +8,26 @@ Type=simple
 Restart=always
 RestartSec=5
 
+# Shut down fast: the poll loop must not drag the shutdown countdown.
+# Without this, Type=simple waits the default ~90s for the loop to exit.
+TimeoutStopSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+
 # Poll for modem presence. If MM has lost the XMM7360 (but the kernel device
 # is still alive — /dev/xmm0/rpc present), request a rescan. Pure userspace:
 # only ever calls `mmcli -S`, never touches the kernel module, so it cannot
 # freeze the system.
-ExecStart=/bin/sh -c '\
+ExecStart=/bin/sh -c 'exec 0<&-; \
     miss=0; \
     while :; do \
-        if [ -e /dev/xmm0/rpc ] && ! mmcli -L 2>/dev/null | grep -q "/Modem/"; then \
+        if [ -e /dev/xmm0/rpc ] && ! timeout 5 mmcli -L 2>/dev/null | grep -q "/Modem/"; then \
             miss=$((miss+1)); \
             if [ "$miss" -ge 2 ]; then \
                 logger -t xmm7360-rescan "modem missing — requesting MM rescan"; \
-                mmcli -S 2>/dev/null || true; \
+                timeout 10 mmcli -S 2>/dev/null || true; \
                 sleep 8; \
-                if mmcli -L 2>/dev/null | grep -q "/Modem/"; then \
+                if timeout 5 mmcli -L 2>/dev/null | grep -q "/Modem/"; then \
                     logger -t xmm7360-rescan "modem reappeared after rescan"; \
                 fi; \
                 miss=0; \

@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,8 +110,31 @@ static void handle_unsolicited(xmm_rpc_t *rpc, const xmm_msg_t *m) {
 int xmm_rpc_pump(xmm_rpc_t *rpc, xmm_msg_t *m) {
     static uint8_t buf[XMM_MAX_MSG];
 
-    /* Retry on EINTR: pkexec / fingerprint auth signals can interrupt read() */
+    /*
+     * Poll with a timeout before reading. The xmm7360 cdev read blocks
+     * until data arrives or the device errors; if the modem came back
+     * from suspend/hibernation alive-but-unresponsive, a bare read()
+     * would block forever, wedging this process in D-state and holding
+     * the RPC channel open (leaking module references). A bounded poll
+     * turns "modem not answering" into a clean timeout error instead.
+     * Retry on EINTR (pkexec / fingerprint auth can interrupt).
+     */
     ssize_t n;
+    int pr;
+    struct pollfd pfd = { .fd = rpc->fd, .events = POLLIN };
+    do {
+        pr = poll(&pfd, 1, XMM_RPC_READ_TIMEOUT_MS);
+    } while (pr < 0 && errno == EINTR);
+    if (pr == 0) {
+        rpc_log("xmm_rpc: read timeout (modem not responding)");
+        errno = ETIMEDOUT;
+        return -1;
+    }
+    if (pr < 0) { rpc_log("xmm_rpc: poll error: %s", strerror(errno)); return -1; }
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        rpc_log("xmm_rpc: device error/hangup on poll");
+        return -1;
+    }
     do {
         n = read(rpc->fd, buf, sizeof(buf));
     } while (n < 0 && errno == EINTR);

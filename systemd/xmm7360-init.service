@@ -2,10 +2,20 @@
 Description=XMM7360 Modem RPC Initialisation
 After=dev-ttyXMM1.device
 Before=ModemManager.service
+# init is best-effort; MM must start even if the RPC wake failed.
+Wants=ModemManager.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+
+# Never let a wedged modem hang boot: if the RPC wake blocks, systemd
+# kills it after 30s and boot continues. (A previous version had no
+# timeout, so a stuck --init-only could stall boot for minutes.)
+TimeoutStartSec=30
+TimeoutStopSec=10
+# A failed/timed-out init must not fail the boot transaction.
+SuccessExitStatus=0 1
 
 EnvironmentFile=-/etc/xmm7360.conf
 

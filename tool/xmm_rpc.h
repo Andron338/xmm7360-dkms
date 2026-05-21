@@ -28,6 +28,11 @@
 /* Maximum single device read — matches Python's 131072 */
 #define XMM_MAX_MSG 131072
 
+/* Max time to wait for an RPC reply before giving up. After suspend/
+ * hibernation the modem may be unresponsive; without a bound the
+ * read would block forever and wedge the init process. */
+#define XMM_RPC_READ_TIMEOUT_MS 8000
+
 /* ── Message ──────────────────────────────────────────────────────────────── */
 
 typedef enum {

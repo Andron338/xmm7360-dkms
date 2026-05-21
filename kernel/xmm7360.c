@@ -509,7 +509,16 @@ static void xmm7360_td_ring_destroy(struct xmm_dev *xmm, u8 ring_id)
 		return;
 	}
 
-	xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
+	/*
+	 * Only ask the firmware to close the ring if the device is still
+	 * alive. After suspend/hibernation the modem may be dead/stale and
+	 * will never acknowledge CMD_RING_CLOSE — sending it would block in
+	 * cmd_ring_wait while holding qp->lock, wedging the close/teardown
+	 * path (pppd stuck in D-state, module refcount stuck, modprobe -r
+	 * fails "in use"). In the error case just reclaim the DMA memory.
+	 */
+	if (!xmm->error)
+		xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
 
 	for (i = 0; i < depth; i++) {
 		dma_free_coherent(xmm->dev, ring->page_size, ring->pages[i],
@@ -1330,6 +1339,19 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 				device_unregister(&xmm->qp[i].dev);
 			}
 			if (xmm->qp[i].port.ops) {
+				/*
+				 * Force-hang up any still-open TTY before
+				 * unregistering. ModemManager (and pppd) keep the
+				 * AT ports open; tty_unregister_device() removes the
+				 * node but does NOT drop the module reference an open
+				 * handle holds. Without this hangup those refs leak
+				 * across a teardown that runs while a port is open
+				 * (e.g. hibernation recovery), leaving refcnt > 0 and
+				 * "module in use" even though no process lists the
+				 * node in lsof. The hangup makes the TTY layer close
+				 * the handle and release the reference.
+				 */
+				tty_port_tty_hangup(&xmm->qp[i].port, false);
 				tty_unregister_device(xmm7360_tty_driver,
 						      xmm->qp[i].tty_index);
 				tty_port_destroy(&xmm->qp[i].port);
@@ -1925,10 +1947,10 @@ static int xmm7360_suspend(struct device *dev)
 }
 
 /*
- * Normal suspend/resume: hardware stayed in D3, DMA coherent memory is
- * still valid. Just re-attach the netdev so the network stack can use it
- * again. Userspace (xmm7360-resume.service → xmm7360-recovery.service)
- * handles the full modem reinit via module reload.
+ * Normal suspend/resume (S3): hardware stayed powered, DMA coherent
+ * memory is still valid. Re-attach the netdev, then emit "resumed" so
+ * the udev rule re-runs xmm7360-init (RPC re-wake) + xmm7360-signal.
+ * No in-callback teardown — recovery policy stays in userspace.
  */
 static int xmm7360_resume(struct device *dev)
 {
@@ -1944,14 +1966,26 @@ static int xmm7360_resume(struct device *dev)
 }
 
 /*
- * Hibernation restore: after loading state from disk the DMA coherent
- * memory physical addresses are stale — attempting to reprogram hardware
- * with them causes a kernel panic. Return 0 and let userspace reload the
- * module cleanly via xmm7360-recovery.service.
+ * Hibernation restore (S4): the system image was written to disk and the
+ * machine fully power-cycled. The DMA coherent memory physical addresses
+ * the restored image "remembers" are stale — reprogramming hardware with
+ * them would panic. So we must NOT touch hardware here. Instead emit
+ * "failed", which the udev rule routes to xmm7360-recovery.service for a
+ * clean module reload (full teardown + fresh probe). This is the only
+ * safe way to recover a fully power-cycled modem; doing it in-callback
+ * would risk the lock-ordering hazards we keep out of the PM path.
  */
 static int xmm7360_restore(struct device *dev)
 {
-	dev_info(dev, "xmm7360: hibernation restore — userspace will reload module\n");
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct xmm_dev *xmm = pci_get_drvdata(pdev);
+
+	dev_info(dev, "xmm7360: hibernation restore — requesting userspace reload\n");
+	/* Mark error so the device is not used with stale DMA state, and so
+	 * any D-state waiters wake. recovery_work is NOT scheduled from here
+	 * (we are in the PM callback); the uevent drives userspace instead. */
+	xmm7360_set_error(xmm, -ENODEV);
+	xmm7360_emit_uevent(xmm, "failed");
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
