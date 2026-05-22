@@ -509,7 +509,16 @@ static void xmm7360_td_ring_destroy(struct xmm_dev *xmm, u8 ring_id)
 		return;
 	}
 
-	xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
+	/*
+	 * Only ask the firmware to close the ring if the device is still
+	 * alive. After suspend/hibernation the modem may be dead/stale and
+	 * will never acknowledge CMD_RING_CLOSE — sending it would block in
+	 * cmd_ring_wait while holding qp->lock, wedging the close/teardown
+	 * path (pppd stuck in D-state, module refcount stuck, modprobe -r
+	 * fails "in use"). In the error case just reclaim the DMA memory.
+	 */
+	if (!xmm->error)
+		xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
 
 	for (i = 0; i < depth; i++) {
 		dma_free_coherent(xmm->dev, ring->page_size, ring->pages[i],
@@ -1330,6 +1339,19 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 				device_unregister(&xmm->qp[i].dev);
 			}
 			if (xmm->qp[i].port.ops) {
+				/*
+				 * Force-hang up any still-open TTY before
+				 * unregistering. ModemManager (and pppd) keep the
+				 * AT ports open; tty_unregister_device() removes the
+				 * node but does NOT drop the module reference an open
+				 * handle holds. Without this hangup those refs leak
+				 * across a teardown that runs while a port is open
+				 * (e.g. hibernation recovery), leaving refcnt > 0 and
+				 * "module in use" even though no process lists the
+				 * node in lsof. The hangup makes the TTY layer close
+				 * the handle and release the reference.
+				 */
+				tty_port_tty_hangup(&xmm->qp[i].port, false);
 				tty_unregister_device(xmm7360_tty_driver,
 						      xmm->qp[i].tty_index);
 				tty_port_destroy(&xmm->qp[i].port);
@@ -1907,10 +1929,30 @@ fail:
 }
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * Suspend / hibernate-freeze.
+ *
+ * The modem firmware does NOT survive a power transition: on resume
+ * its DMA rings, BAR state and command ring are stale, and touching
+ * them panics. So the only safe strategy is to treat the device as
+ * GONE the moment we suspend. We set the error flag FIRST (while the
+ * hardware is still alive and responsive) — this stops all readers,
+ * wakes any waiters, and ensures no ring/command path runs during or
+ * after the transition. Then we quiesce the netdev and timers.
+ *
+ * We deliberately do NOT tear down the cdev/tty devices here: the
+ * device nodes stay registered so userspace handles are not yanked
+ * mid-suspend. The full hardware reset happens on resume via a
+ * userspace module reload (see xmm7360_resume).
+ */
 static int xmm7360_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
+
+	/* Mark the device unusable BEFORE anything else, while hardware
+	 * is still alive. After this no ring/command access will run. */
+	xmm7360_set_error(xmm, -ENODEV);
 
 	if (xmm->netdev) {
 		netif_stop_queue(xmm->netdev);
@@ -1920,7 +1962,7 @@ static int xmm7360_suspend(struct device *dev)
 		hrtimer_cancel(&xmm->net->deadline);
 	cancel_work_sync(&xmm->init_work);
 
-	dev_info(dev, "xmm7360: suspended\n");
+	dev_info(dev, "xmm7360: suspended (device marked for reload on resume)\n");
 	return 0;
 }
 
@@ -1930,16 +1972,30 @@ static int xmm7360_suspend(struct device *dev)
  * the udev rule re-runs xmm7360-init (RPC re-wake) + xmm7360-signal.
  * No in-callback teardown — recovery policy stays in userspace.
  */
+/*
+ * Resume / hibernate-thaw / hibernate-restore.
+ *
+ * CRITICAL: do not touch the hardware here. The firmware was power-
+ * cycled and all device state (DMA rings, command ring, BAR2) is
+ * stale; reattaching the netdev or reading any ring would dereference
+ * garbage and panic (observed: reliable panic on resume). The device
+ * is already in the error state (set in suspend). The ONLY reliable
+ * way to recover this modem is a full re-probe, which we delegate to
+ * userspace: emit "failed" so the udev rule starts
+ * xmm7360-recovery.service, which does modprobe -r / modprobe once the
+ * system is fully back up. No hardware access, no netif_device_attach,
+ * no in-callback rebuild.
+ */
 static int xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
-	if (xmm->netdev)
-		netif_device_attach(xmm->netdev);
+	/* Device state is stale post power-cycle; keep it marked dead. */
+	xmm7360_set_error(xmm, -ENODEV);
 
-	dev_info(dev, "xmm7360: resumed\n");
-	xmm7360_emit_uevent(xmm, "resumed");
+	dev_info(dev, "xmm7360: resumed — requesting userspace module reload\n");
+	xmm7360_emit_uevent(xmm, "failed");
 	return 0;
 }
 
@@ -1953,27 +2009,17 @@ static int xmm7360_resume(struct device *dev)
  * safe way to recover a fully power-cycled modem; doing it in-callback
  * would risk the lock-ordering hazards we keep out of the PM path.
  */
-static int xmm7360_restore(struct device *dev)
-{
-	struct pci_dev *pdev = to_pci_dev(dev);
-	struct xmm_dev *xmm = pci_get_drvdata(pdev);
-
-	dev_info(dev, "xmm7360: hibernation restore — requesting userspace reload\n");
-	/* Mark error so the device is not used with stale DMA state, and so
-	 * any D-state waiters wake. recovery_work is NOT scheduled from here
-	 * (we are in the PM callback); the uevent drives userspace instead. */
-	xmm7360_set_error(xmm, -ENODEV);
-	xmm7360_emit_uevent(xmm, "failed");
-	return 0;
-}
 #endif /* CONFIG_PM_SLEEP */
 
 static const struct dev_pm_ops xmm7360_pm_ops = {
+	/* Every resume-side callback uses the same safe handler: mark the
+	 * device dead and request a userspace reload. None touch hardware. */
 	.suspend  = xmm7360_suspend,
 	.resume   = xmm7360_resume,
-	.freeze   = xmm7360_suspend,   /* hibernate pre-save  */
-	.thaw     = xmm7360_resume,    /* hibernate cancelled */
-	.restore  = xmm7360_restore,   /* hibernate post-load: no-op */
+	.freeze   = xmm7360_suspend,   /* hibernate: pre-image, hw still alive */
+	.thaw     = xmm7360_resume,    /* hibernate cancelled: reload anyway   */
+	.restore  = xmm7360_resume,    /* hibernate resumed: reload (was stale) */
+	.poweroff = xmm7360_suspend,   /* hibernate: final power down           */
 };
 
 static struct pci_driver xmm7360_driver = {
