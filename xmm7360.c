@@ -39,6 +39,7 @@
  */
 
 #include <linux/version.h>
+#include <linux/suspend.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
@@ -1945,14 +1946,18 @@ fail:
  * mid-suspend. The full hardware reset happens on resume via a
  * userspace module reload (see xmm7360_resume).
  */
+/*
+ * S3 suspend. The device stays powered, so we just quiesce: stop the
+ * netdev queue, detach it, cancel the data-path timer and init work.
+ * We do NOT set the error flag or tear down rings -- the device is
+ * expected to survive S3, and resume re-attaches. (Hibernation/S4 never
+ * reaches here: the PM notifier unbinds the driver before the image is
+ * written.)
+ */
 static int xmm7360_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
-
-	/* Mark the device unusable BEFORE anything else, while hardware
-	 * is still alive. After this no ring/command access will run. */
-	xmm7360_set_error(xmm, -ENODEV);
 
 	if (xmm->netdev) {
 		netif_stop_queue(xmm->netdev);
@@ -1962,7 +1967,7 @@ static int xmm7360_suspend(struct device *dev)
 		hrtimer_cancel(&xmm->net->deadline);
 	cancel_work_sync(&xmm->init_work);
 
-	dev_info(dev, "xmm7360: suspended (device marked for reload on resume)\n");
+	dev_info(dev, "xmm7360: suspended (S3)\n");
 	return 0;
 }
 
@@ -1986,16 +1991,24 @@ static int xmm7360_suspend(struct device *dev)
  * system is fully back up. No hardware access, no netif_device_attach,
  * no in-callback rebuild.
  */
+/*
+ * S3 resume. The device stayed powered across suspend, so unlike S4
+ * (handled by the PM notifier via unbind/rebind) we do not tear down.
+ * Re-attach the netdev and clear the suspend-time error so the data
+ * path resumes. If the firmware did not actually survive, the data-
+ * flow watchdog + recovery_work will detect the stall and rebuild --
+ * that path is safe (runs from a workqueue, not here).
+ */
 static int xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
-	/* Device state is stale post power-cycle; keep it marked dead. */
-	xmm7360_set_error(xmm, -ENODEV);
+	xmm->error = 0;
+	if (xmm->netdev)
+		netif_device_attach(xmm->netdev);
 
-	dev_info(dev, "xmm7360: resumed — requesting userspace module reload\n");
-	xmm7360_emit_uevent(xmm, "failed");
+	dev_info(dev, "xmm7360: resumed (S3)\n");
 	return 0;
 }
 
@@ -2011,15 +2024,16 @@ static int xmm7360_resume(struct device *dev)
  */
 #endif /* CONFIG_PM_SLEEP */
 
+/*
+ * Only S3 (suspend-to-RAM / s2idle) goes through pm_ops; the device
+ * stays powered there. Hibernation (S4) is handled entirely by
+ * xmm7360_pm_notifier (unbind before image, re-probe after), so the
+ * .freeze/.thaw/.restore/.poweroff callbacks are intentionally unset --
+ * by the time they would run, the driver is already unbound.
+ */
 static const struct dev_pm_ops xmm7360_pm_ops = {
-	/* Every resume-side callback uses the same safe handler: mark the
-	 * device dead and request a userspace reload. None touch hardware. */
-	.suspend  = xmm7360_suspend,
-	.resume   = xmm7360_resume,
-	.freeze   = xmm7360_suspend,   /* hibernate: pre-image, hw still alive */
-	.thaw     = xmm7360_resume,    /* hibernate cancelled: reload anyway   */
-	.restore  = xmm7360_resume,    /* hibernate resumed: reload (was stale) */
-	.poweroff = xmm7360_suspend,   /* hibernate: final power down           */
+	.suspend = xmm7360_suspend,
+	.resume  = xmm7360_resume,
 };
 
 static struct pci_driver xmm7360_driver = {
@@ -2028,6 +2042,53 @@ static struct pci_driver xmm7360_driver = {
 	.probe    = xmm7360_probe,
 	.remove   = xmm7360_remove,
 	.driver.pm = &xmm7360_pm_ops,
+};
+
+/*
+ * Hibernation handling, ported from Intel's in-tree iosm driver.
+ *
+ * The XMM7360 is a PCIe device whose firmware does NOT survive the S4 power
+ * cycle: if the driver stays bound across hibernation, the restored image
+ * contains stale DMA/ring/IRQ state, and the first IRQ on resume dereferences
+ * garbage -> "fatal exception in interrupt" panic.
+ *
+ * Intel sidesteps this entirely: before the hibernation image is written,
+ * unbind the driver from the device (pci_unregister_driver runs the normal
+ * .remove teardown). The snapshot is therefore taken with NO driver attached,
+ * so there is no stale state to restore. After hibernation, re-register the
+ * driver, which re-probes the device cleanly -- exactly like a cold boot
+ * (which we know works).
+ */
+static bool xmm7360_pci_registered;
+
+static int xmm7360_pm_notify(struct notifier_block *nb, unsigned long mode,
+			     void *unused)
+{
+	switch (mode) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		/* Unbind before the image is written / before restore. */
+		if (xmm7360_pci_registered) {
+			pci_unregister_driver(&xmm7360_driver);
+			xmm7360_pci_registered = false;
+		}
+		break;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		/* Re-bind: re-probe the device from scratch (cold-boot path). */
+		if (!xmm7360_pci_registered) {
+			if (pci_register_driver(&xmm7360_driver) == 0)
+				xmm7360_pci_registered = true;
+			else
+				pr_err("xmm7360: failed to re-register after hibernation\n");
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block xmm7360_pm_notifier = {
+	.notifier_call = xmm7360_pm_notify,
 };
 
 static int xmm7360_init(void)
@@ -2069,15 +2130,26 @@ static int xmm7360_init(void)
 
 	ret = pci_register_driver(&xmm7360_driver);
 	if (ret) {
+		tty_unregister_driver(xmm7360_tty_driver);
+		tty_driver_kref_put(xmm7360_tty_driver);
+		unregister_chrdev_region(xmm_base, 8);
 		return ret;
 	}
+	xmm7360_pci_registered = true;
+
+	/* Hibernation: unbind before S4 image, re-probe after (iosm style). */
+	register_pm_notifier(&xmm7360_pm_notifier);
 
 	return 0;
 }
 
 static void xmm7360_exit(void)
 {
-	pci_unregister_driver(&xmm7360_driver);
+	unregister_pm_notifier(&xmm7360_pm_notifier);
+	if (xmm7360_pci_registered) {
+		pci_unregister_driver(&xmm7360_driver);
+		xmm7360_pci_registered = false;
+	}
 	unregister_chrdev_region(xmm_base, 8);
 	tty_unregister_driver(xmm7360_tty_driver);
 	tty_driver_kref_put(xmm7360_tty_driver);
