@@ -1,0 +1,56 @@
+#!/bin/bash
+# /usr/lib/systemd/system-sleep/xmm7360
+#
+# Bring the LTE data connection DOWN cleanly before the system sleeps, and
+# allow it to come back AFTER resume.
+#
+# Why: the xmm7360 is a PCIe modem whose data path uses live DMA rings. If the
+# system enters S3/S4 with an ACTIVE connection, the in-flight DMA / armed ring
+# descriptors do not survive the power transition and the device faults on
+# resume (kernel panic). Suspending while IDLE is safe. So we force the idle
+# state first — disconnect here, while the device is fully alive and can be
+# torn down cleanly in userspace, instead of crashing inside a kernel PM
+# callback.
+#
+# systemd calls this as:  xmm7360 {pre|post} {suspend|hibernate|...}
+
+phase="$1"
+# action="$2"   # suspend / hibernate / hybrid-sleep / suspend-then-hibernate
+
+log() { logger -t xmm7360-sleep "$*"; }
+
+case "$phase" in
+    pre)
+        log "pre-sleep: bringing modem connection down before suspend"
+
+        # 1. Bring down any active NetworkManager gsm/modem connection.
+        #    (NM names vary, so match by type=gsm.)
+        for c in $(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+                   | awk -F: '$2=="gsm"{print $1}'); do
+            log "  nmcli down: $c"
+            nmcli connection down "$c" 2>/dev/null || true
+        done
+
+        # 2. Belt-and-suspenders: tell ModemManager to disconnect any modem,
+        #    so the kernel data-path queue pair is quiesced (rings drained).
+        for m in $(mmcli -L 2>/dev/null | grep -oE '/Modem/[0-9]+' | tr -d '\n' \
+                   | grep -oE '[0-9]+$'); do
+            log "  mmcli disconnect modem $m"
+            timeout 8 mmcli -m "$m" --simple-disconnect 2>/dev/null || true
+        done
+
+        # 3. Give the kernel a moment to finish tearing down the DMA rings
+        #    before power is pulled.
+        sleep 1
+        log "pre-sleep: modem idle, safe to suspend"
+        ;;
+
+    post)
+        log "post-resume: modem will reconnect via autoconnect / rescan service"
+        # Nudge ModemManager to re-scan in case it dropped the modem; the
+        # xmm7360-rescan service + NM autoconnect handle the actual reconnect.
+        timeout 10 mmcli -S 2>/dev/null || true
+        ;;
+esac
+
+exit 0
