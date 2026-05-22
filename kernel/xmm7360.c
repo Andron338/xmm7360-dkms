@@ -39,6 +39,7 @@
  */
 
 #include <linux/version.h>
+#include <linux/suspend.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
@@ -1929,6 +1930,30 @@ fail:
 }
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * Suspend / hibernate-freeze.
+ *
+ * The modem firmware does NOT survive a power transition: on resume
+ * its DMA rings, BAR state and command ring are stale, and touching
+ * them panics. So the only safe strategy is to treat the device as
+ * GONE the moment we suspend. We set the error flag FIRST (while the
+ * hardware is still alive and responsive) — this stops all readers,
+ * wakes any waiters, and ensures no ring/command path runs during or
+ * after the transition. Then we quiesce the netdev and timers.
+ *
+ * We deliberately do NOT tear down the cdev/tty devices here: the
+ * device nodes stay registered so userspace handles are not yanked
+ * mid-suspend. The full hardware reset happens on resume via a
+ * userspace module reload (see xmm7360_resume).
+ */
+/*
+ * S3 suspend. The device stays powered, so we just quiesce: stop the
+ * netdev queue, detach it, cancel the data-path timer and init work.
+ * We do NOT set the error flag or tear down rings -- the device is
+ * expected to survive S3, and resume re-attaches. (Hibernation/S4 never
+ * reaches here: the PM notifier unbinds the driver before the image is
+ * written.)
+ */
 static int xmm7360_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -1942,7 +1967,7 @@ static int xmm7360_suspend(struct device *dev)
 		hrtimer_cancel(&xmm->net->deadline);
 	cancel_work_sync(&xmm->init_work);
 
-	dev_info(dev, "xmm7360: suspended\n");
+	dev_info(dev, "xmm7360: suspended (S3)\n");
 	return 0;
 }
 
@@ -1952,16 +1977,38 @@ static int xmm7360_suspend(struct device *dev)
  * the udev rule re-runs xmm7360-init (RPC re-wake) + xmm7360-signal.
  * No in-callback teardown — recovery policy stays in userspace.
  */
+/*
+ * Resume / hibernate-thaw / hibernate-restore.
+ *
+ * CRITICAL: do not touch the hardware here. The firmware was power-
+ * cycled and all device state (DMA rings, command ring, BAR2) is
+ * stale; reattaching the netdev or reading any ring would dereference
+ * garbage and panic (observed: reliable panic on resume). The device
+ * is already in the error state (set in suspend). The ONLY reliable
+ * way to recover this modem is a full re-probe, which we delegate to
+ * userspace: emit "failed" so the udev rule starts
+ * xmm7360-recovery.service, which does modprobe -r / modprobe once the
+ * system is fully back up. No hardware access, no netif_device_attach,
+ * no in-callback rebuild.
+ */
+/*
+ * S3 resume. The device stayed powered across suspend, so unlike S4
+ * (handled by the PM notifier via unbind/rebind) we do not tear down.
+ * Re-attach the netdev and clear the suspend-time error so the data
+ * path resumes. If the firmware did not actually survive, the data-
+ * flow watchdog + recovery_work will detect the stall and rebuild --
+ * that path is safe (runs from a workqueue, not here).
+ */
 static int xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
+	xmm->error = 0;
 	if (xmm->netdev)
 		netif_device_attach(xmm->netdev);
 
-	dev_info(dev, "xmm7360: resumed\n");
-	xmm7360_emit_uevent(xmm, "resumed");
+	dev_info(dev, "xmm7360: resumed (S3)\n");
 	return 0;
 }
 
@@ -1975,27 +2022,18 @@ static int xmm7360_resume(struct device *dev)
  * safe way to recover a fully power-cycled modem; doing it in-callback
  * would risk the lock-ordering hazards we keep out of the PM path.
  */
-static int xmm7360_restore(struct device *dev)
-{
-	struct pci_dev *pdev = to_pci_dev(dev);
-	struct xmm_dev *xmm = pci_get_drvdata(pdev);
-
-	dev_info(dev, "xmm7360: hibernation restore — requesting userspace reload\n");
-	/* Mark error so the device is not used with stale DMA state, and so
-	 * any D-state waiters wake. recovery_work is NOT scheduled from here
-	 * (we are in the PM callback); the uevent drives userspace instead. */
-	xmm7360_set_error(xmm, -ENODEV);
-	xmm7360_emit_uevent(xmm, "failed");
-	return 0;
-}
 #endif /* CONFIG_PM_SLEEP */
 
+/*
+ * Only S3 (suspend-to-RAM / s2idle) goes through pm_ops; the device
+ * stays powered there. Hibernation (S4) is handled entirely by
+ * xmm7360_pm_notifier (unbind before image, re-probe after), so the
+ * .freeze/.thaw/.restore/.poweroff callbacks are intentionally unset --
+ * by the time they would run, the driver is already unbound.
+ */
 static const struct dev_pm_ops xmm7360_pm_ops = {
-	.suspend  = xmm7360_suspend,
-	.resume   = xmm7360_resume,
-	.freeze   = xmm7360_suspend,   /* hibernate pre-save  */
-	.thaw     = xmm7360_resume,    /* hibernate cancelled */
-	.restore  = xmm7360_restore,   /* hibernate post-load: no-op */
+	.suspend = xmm7360_suspend,
+	.resume  = xmm7360_resume,
 };
 
 static struct pci_driver xmm7360_driver = {
@@ -2004,6 +2042,53 @@ static struct pci_driver xmm7360_driver = {
 	.probe    = xmm7360_probe,
 	.remove   = xmm7360_remove,
 	.driver.pm = &xmm7360_pm_ops,
+};
+
+/*
+ * Hibernation handling, ported from Intel's in-tree iosm driver.
+ *
+ * The XMM7360 is a PCIe device whose firmware does NOT survive the S4 power
+ * cycle: if the driver stays bound across hibernation, the restored image
+ * contains stale DMA/ring/IRQ state, and the first IRQ on resume dereferences
+ * garbage -> "fatal exception in interrupt" panic.
+ *
+ * Intel sidesteps this entirely: before the hibernation image is written,
+ * unbind the driver from the device (pci_unregister_driver runs the normal
+ * .remove teardown). The snapshot is therefore taken with NO driver attached,
+ * so there is no stale state to restore. After hibernation, re-register the
+ * driver, which re-probes the device cleanly -- exactly like a cold boot
+ * (which we know works).
+ */
+static bool xmm7360_pci_registered;
+
+static int xmm7360_pm_notify(struct notifier_block *nb, unsigned long mode,
+			     void *unused)
+{
+	switch (mode) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		/* Unbind before the image is written / before restore. */
+		if (xmm7360_pci_registered) {
+			pci_unregister_driver(&xmm7360_driver);
+			xmm7360_pci_registered = false;
+		}
+		break;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		/* Re-bind: re-probe the device from scratch (cold-boot path). */
+		if (!xmm7360_pci_registered) {
+			if (pci_register_driver(&xmm7360_driver) == 0)
+				xmm7360_pci_registered = true;
+			else
+				pr_err("xmm7360: failed to re-register after hibernation\n");
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block xmm7360_pm_notifier = {
+	.notifier_call = xmm7360_pm_notify,
 };
 
 static int xmm7360_init(void)
@@ -2045,15 +2130,26 @@ static int xmm7360_init(void)
 
 	ret = pci_register_driver(&xmm7360_driver);
 	if (ret) {
+		tty_unregister_driver(xmm7360_tty_driver);
+		tty_driver_kref_put(xmm7360_tty_driver);
+		unregister_chrdev_region(xmm_base, 8);
 		return ret;
 	}
+	xmm7360_pci_registered = true;
+
+	/* Hibernation: unbind before S4 image, re-probe after (iosm style). */
+	register_pm_notifier(&xmm7360_pm_notifier);
 
 	return 0;
 }
 
 static void xmm7360_exit(void)
 {
-	pci_unregister_driver(&xmm7360_driver);
+	unregister_pm_notifier(&xmm7360_pm_notifier);
+	if (xmm7360_pci_registered) {
+		pci_unregister_driver(&xmm7360_driver);
+		xmm7360_pci_registered = false;
+	}
 	unregister_chrdev_region(xmm_base, 8);
 	tty_unregister_driver(xmm7360_tty_driver);
 	tty_driver_kref_put(xmm7360_tty_driver);
