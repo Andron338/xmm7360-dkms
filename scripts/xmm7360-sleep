@@ -2,73 +2,82 @@
 # /usr/lib/systemd/system-sleep/xmm7360
 #
 # Make the modem SAFE to suspend/hibernate by ensuring NO userspace process
-# holds its char/tty devices open before the kernel tears the driver down.
+# holds its char/tty devices open when the kernel PM notifier unbinds the
+# driver (pci_unregister_driver -> xmm7360_remove -> kfree(xmm)). The per-
+# channel cdev/tty_port live inside the freed xmm, so a close() that races
+# the unbind walks freed memory -> cdev list corruption (oops) or a wedged
+# tty_release mutex (ModemManager stuck in D-state, freeze fails).
 #
-# Why this is required:
-#   The PCIe modem's data path uses live DMA rings, and the driver's PM
-#   notifier unbinds the driver (pci_unregister_driver) across the sleep
-#   transition to avoid resuming with stale device state. BUT the driver's
-#   per-channel cdev and tty_port structs are embedded in a queue_pair that
-#   the teardown frees/zeroes. If ModemManager (which keeps the ttyXMM AT
-#   ports open) or pppd / open_xdatachannel still hold those fds when the
-#   unbind runs, their later close() walks freed kernel structures —
-#   corrupting a cdev list (-> kernel oops in cdev_put/cd_forget) or
-#   deadlocking in tty_release on a zeroed mutex (-> hibernate freeze fails,
-#   UI wedges). Cold-boot suspend works only because nothing holds the ports
-#   yet; after a few minutes of real use MM/pppd do, and it crashes.
-#
-#   userspace system-sleep hooks run BEFORE the kernel PM notifier, so this
-#   is the correct place to release every fd first. We stop ModemManager so
-#   it closes the tty ports, kill any pppd/tool still holding a port, and
-#   only THEN let the kernel unbind cleanly.
+# userspace system-sleep hooks run BEFORE the kernel PM notifier, so this is
+# where we drive everything to the "no open fds" state. CRITICAL: we must also
+# stop our OWN helper services first, otherwise the rescan poll / init udev
+# rule can RE-OPEN the modem in the window between this hook and the unbind,
+# re-introducing the race. Order: freeze our services -> drop connection ->
+# stop MM -> kill stragglers -> verify nothing holds the device.
 #
 # systemd calls this as:  xmm7360 {pre|post} {suspend|hibernate|...}
 
 phase="$1"
 log() { logger -t xmm7360-sleep "$*"; }
 
+HELPERS="xmm7360-rescan.service xmm7360-init.service xmm7360-signal.service"
+
+holders() {  # list PIDs holding any modem device open
+    { fuser /dev/ttyXMM* 2>/dev/null; fuser /dev/xmm0/* 2>/dev/null; } \
+        | tr -s ' ' '\n' | grep -E '^[0-9]+$' | sort -u
+}
+
 case "$phase" in
     pre)
-        log "pre-sleep: releasing all modem fds before kernel unbind"
+        log "pre-sleep: quiescing modem before kernel unbind"
 
-        # 1. Bring down any active gsm/modem NM connection (drops pppd cleanly).
-        for c in $(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
-                   | awk -F: '$2=="gsm"{print $1}'); do
-            log "  nmcli down: $c"
-            timeout 8 nmcli connection down "$c" 2>/dev/null || true
+        # 1. Stop our helpers FIRST so nothing re-opens the modem behind us.
+        for s in $HELPERS; do
+            systemctl is-active --quiet "$s" && \
+                { log "  stop $s"; timeout 10 systemctl stop "$s" 2>/dev/null || true; }
         done
 
-        # 2. Stop ModemManager so it CLOSES the ttyXMM AT ports. This is the
-        #    key step: while MM runs it keeps those ports open, and the kernel
-        #    unbind would free them out from under it. Stopping MM (and waiting
-        #    for it to exit) guarantees those fds are closed.
+        # 2. Bring down any active gsm/modem connection (drops pppd).
+        for c in $(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+                   | awk -F: '$2=="gsm"{print $1}'); do
+            log "  nmcli down: $c"; timeout 8 nmcli connection down "$c" 2>/dev/null || true
+        done
+
+        # 3. Stop ModemManager so it closes the ttyXMM ports (the main holder).
         if systemctl is-active --quiet ModemManager; then
-            log "  stopping ModemManager (closes ttyXMM ports)"
-            timeout 15 systemctl stop ModemManager 2>/dev/null || true
+            log "  stopping ModemManager"; timeout 15 systemctl stop ModemManager 2>/dev/null || true
         fi
 
-        # 3. Kill anything else still holding a modem device open.
+        # 4. Kill any straggler still holding a port.
         for proc in pppd open_xdatachannel; do
-            if pgrep -x "$proc" >/dev/null 2>&1; then
-                log "  killing $proc (still holding a port)"
-                pkill -TERM -x "$proc" 2>/dev/null || true
-            fi
+            pgrep -x "$proc" >/dev/null 2>&1 && { log "  kill $proc"; pkill -TERM -x "$proc" 2>/dev/null || true; }
         done
         sleep 1
         pkill -KILL -x pppd 2>/dev/null || true
         pkill -KILL -x open_xdatachannel 2>/dev/null || true
 
-        # 4. Give the kernel a moment to process the closes before it unbinds.
-        sleep 1
-        log "pre-sleep: all modem fds released, safe to suspend"
+        # 5. VERIFY the device is actually free before letting the kernel sleep.
+        #    Wait up to ~5s for the last fd to drop; if a holder persists, kill it.
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            h="$(holders)"; [ -z "$h" ] && break
+            log "  still held by: $h — waiting"; sleep 0.5
+        done
+        h="$(holders)"
+        if [ -n "$h" ]; then
+            log "  forcing kill of remaining holders: $h"
+            # shellcheck disable=SC2086
+            kill -KILL $h 2>/dev/null || true
+            sleep 1
+        fi
+        log "pre-sleep: modem device released, safe to suspend"
         ;;
 
     post)
-        log "post-resume: restarting ModemManager to re-probe the modem"
-        # The kernel re-probed the device on resume (PM notifier rebind).
-        # Restart MM so it re-detects the fresh modem and autoconnect resumes.
+        log "post-resume: restoring helpers + ModemManager"
         timeout 15 systemctl start ModemManager 2>/dev/null || true
+        for s in $HELPERS; do
+            timeout 10 systemctl start "$s" 2>/dev/null || true
+        done
         ;;
 esac
-
 exit 0
