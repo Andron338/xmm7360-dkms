@@ -1389,6 +1389,8 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 	xmm7360_cmd_ring_free(xmm);
 }
 
+static void xmm7360_free(struct kref *kref);
+
 static void xmm7360_remove(struct pci_dev *dev)
 {
 	struct xmm_dev *xmm = pci_get_drvdata(dev);
