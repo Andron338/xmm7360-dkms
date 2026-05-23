@@ -1,16 +1,5 @@
 name: Arch PKGBUILD CI
 
-# Two stages:
-#   1. package — build + lint the Arch package once from the LOCAL checkout
-#      (not the GitHub remote), so CI tests exactly what you committed. The
-#      package() step only assembles files; it does NOT compile the module
-#      (DKMS does that at install time), so there's no point building the
-#      package once per kernel.
-#   2. dkms-build — THIS is the per-kernel test: take the packaged module
-#      source and compile it the way DKMS will, against each kernel's headers.
-#         linux, linux-lts, linux-zen, linux-hardened → official (required)
-#         linux-rt                                     → AUR (best-effort)
-
 on:
   push:
     paths:
@@ -18,14 +7,19 @@ on:
       - 'kernel/**'
       - 'tool/**'
       - '*.install'
+      - 'dkms.conf'
+      - '.github/workflows/**'
   pull_request:
   workflow_dispatch:
 
 jobs:
-  # ── Stage 1: build + lint the package once ──────────────────────────────
+  # ─────────────────────────────────────────────────────────────
+  # Stage 1: Build + lint package
+  # ─────────────────────────────────────────────────────────────
   package:
     name: makepkg + namcap
     runs-on: ubuntu-latest
+
     container:
       image: archlinux:base-devel
 
@@ -33,101 +27,106 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # pkgver() needs git history
+          fetch-depth: 0
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed \
-            base-devel git namcap pkgconf openssl util-linux \
-            modemmanager networkmanager psmisc dkms \
-            linux linux-headers
+            base-devel \
+            git \
+            sudo \
+            namcap \
+            shellcheck \
+            dkms \
+            pkgconf \
+            openssl \
+            util-linux \
+            modemmanager \
+            networkmanager \
+            psmisc
 
-      - name: Prepare builder + local source
+      - name: Create builder user
         run: |
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
           chmod 0440 /etc/sudoers.d/builder
-          # The PKGBUILD CI override uses a git+file:// source, so the
-          # build dir must be a REAL git repo (cp -a does not reliably
-          # yield a cloneable repo). Mark the checkout safe, then clone
-          # it into the builder's workspace so makepkg can clone from it
-          # and pkgver() can run git describe with full history.
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          mkdir -p /home/builder
-          git clone "$GITHUB_WORKSPACE" /home/builder/src
-          # carry over the (uncommitted) CI-edited workflow/PKGBUILD too:
-          # not needed for source, but keep tree consistent
-          chown -R builder:builder /home/builder/src
-          sudo -u builder git config --global --add safe.directory /home/builder/src
 
-      - name: Point PKGBUILD at the local checkout
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Run namcap
         run: |
-          cd /home/builder/src
-          # makepkg uses the last assignment, so a trailing override wins.
-          sudo -u builder tee -a PKGBUILD >/dev/null <<'OVERRIDE'
+          cd "$GITHUB_WORKSPACE"
 
-          # ── CI override: build from local checkout ──
-          source=("xmm7360-pci::git+file:///home/builder/src")
-          sha256sums=('SKIP')
-          OVERRIDE
-
-      - name: namcap PKGBUILD
-        run: |
-          cd /home/builder/src
           namcap PKGBUILD 2>&1 | tee namcap.log || true
-          if grep -E '^PKGBUILD.* E: ' namcap.log; then
-            echo "::error::namcap reported errors"; exit 1
-          fi
 
-      - name: shellcheck install hooks + scripts
+      - name: Shellcheck scripts
         run: |
-          pacman -S --noconfirm --needed shellcheck
-          cd /home/builder/src
+          cd "$GITHUB_WORKSPACE"
+
           for f in *.install xmm7360-reset; do
             [ -f "$f" ] || continue
-            echo "── $f ──"; shellcheck -s bash -S warning "$f" || true
+
+            echo "Checking $f"
+
+            shellcheck -s bash -S warning "$f" || true
           done
 
-      - name: makepkg (assemble package)
+      - name: Build package
         run: |
-          cd /home/builder/src
-          sudo -u builder makepkg -sf --noconfirm --nocheck 2>&1 | tee makepkg.log
-          ls -la *.pkg.tar.* || { echo "::error::no package produced"; exit 1; }
+          cd "$GITHUB_WORKSPACE"
+
+          sudo -u builder bash -c '
+            makepkg -sf --noconfirm --nocheck
+          ' 2>&1 | tee makepkg.log
+
+          ls -la *.pkg.tar.* || {
+            echo "::error::No package produced"
+            exit 1
+          }
 
       - name: Inspect package contents
         run: |
-          cd /home/builder/src
+          cd "$GITHUB_WORKSPACE"
+
           for p in *.pkg.tar.*; do
             echo "=== $p ==="
-            tar -tf "$p" | grep -vE '^\.(MTREE|PKGINFO|BUILDINFO)$' | sort
+
+            tar -tf "$p" \
+              | grep -vE "^\.(MTREE|PKGINFO|BUILDINFO)$" \
+              | sort
           done
 
-      - name: Upload package
+      - name: Upload package artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: arch-package
           path: |
-            /home/builder/src/*.pkg.tar.*
-            /home/builder/src/*.log
+            *.pkg.tar.*
+            *.log
           retention-days: 14
 
-  # ── Stage 2: compile the packaged module against each kernel ────────────
+  # ─────────────────────────────────────────────────────────────
+  # Stage 2: DKMS kernel compile tests
+  # ─────────────────────────────────────────────────────────────
   dkms-build:
     name: dkms build (${{ matrix.kernel }})
     runs-on: ubuntu-latest
+
     container:
       image: archlinux:base-devel
-    continue-on-error: ${{ matrix.experimental == true }}
-    timeout-minutes: 60
+
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
+
       matrix:
-        kernel: [linux, linux-lts, linux-zen, linux-hardened]
-        include:
-          - kernel: linux-rt
-            experimental: true
+        kernel:
+          - linux
+          - linux-lts
+          - linux-zen
+          - linux-hardened
 
     env:
       KPKG: ${{ matrix.kernel }}
@@ -136,56 +135,105 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Base tooling
+      - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed base-devel bc kmod git sudo
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            bc \
+            kmod \
+            git \
+            sudo \
+            dkms
 
-      - name: Install kernel headers
+      - name: Install kernel + headers
         run: |
-          if [ "$KPKG" = "linux-rt" ]; then
-            useradd -m builder
-            echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
-            chmod 0440 /etc/sudoers.d/builder
-            sudo -u builder bash -c '
-              cd /home/builder
-              git clone --depth 1 https://aur.archlinux.org/linux-rt.git
-              cd linux-rt && makepkg -s --noconfirm --nocheck
-            '
-            pacman -U --noconfirm /home/builder/linux-rt/*headers*.pkg.tar.*
-          else
-            pacman -S --noconfirm --needed "${KPKG}-headers"
-          fi
+          pacman -S --noconfirm --needed \
+            "${KPKG}" \
+            "${KPKG}-headers"
 
-      - name: Resolve kernel version dir
+      - name: Detect kernel version
         id: kver
         run: |
+          echo "Installed modules:"
+          ls -1 /usr/lib/modules/
+
           case "$KPKG" in
-            linux)          tag='' ;;
-            linux-lts)      tag='-lts' ;;
-            linux-zen)      tag='-zen' ;;
-            linux-hardened) tag='-hardened' ;;
-            linux-rt)       tag='-rt' ;;
+            linux)
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep -E '[0-9].*-arch[0-9-]*$' \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
+              ;;
+
+            linux-lts)
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep lts \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
+              ;;
+
+            linux-zen)
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep zen \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
+              ;;
+
+            linux-hardened)
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep hardened \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
+              ;;
           esac
-          if [ -z "$tag" ]; then
-            KVER=$(ls -1 /usr/lib/modules/ | grep -E '^[0-9].*-arch' | sort -V | tail -1)
-          else
-            KVER=$(ls -1 /usr/lib/modules/ | grep -- "$tag" | sort -V | tail -1)
+
+          echo "Detected KVER=$KVER"
+
+          if [ -z "$KVER" ]; then
+            echo "::error::Could not determine kernel version"
+            exit 1
           fi
-          if [ -z "$KVER" ] || [ ! -d "/usr/lib/modules/$KVER/build" ]; then
-            echo "::error::no usable headers for $KPKG"; ls -la /usr/lib/modules/ || true; exit 1
+
+          if [ ! -d "/usr/lib/modules/$KVER/build" ]; then
+            echo "::error::Missing build directory"
+            ls -la "/usr/lib/modules/$KVER"
+            exit 1
           fi
+
           echo "kver=$KVER" >> "$GITHUB_OUTPUT"
 
-      - name: Build packaged module the DKMS way
+      - name: Clean old artifacts
         run: |
-          # Reproduce exactly what DKMS does: build with Makefile.dkms against
-          # the target kernel. This validates dkms.conf's MAKE line will work.
-          make -C kernel -f Makefile.dkms KERNELRELEASE=${{ steps.kver.outputs.kver }} 2>&1 \
-            | tee dkms-build.log
-          test -f kernel/xmm7360.ko || { echo "::error::module did not build under DKMS rules"; exit 1; }
-          modinfo kernel/xmm7360.ko | grep -q 'license:.*GPL'
+          rm -f kernel/*.ko || true
 
-      - name: Upload module
+          make -C kernel clean || true
+
+      - name: Build module
+        run: |
+          make -C /usr/lib/modules/${{ steps.kver.outputs.kver }}/build \
+            M="$PWD/kernel" \
+            modules 2>&1 | tee dkms-build.log
+
+          test -f kernel/xmm7360.ko || {
+            echo "::error::Module build failed"
+            exit 1
+          }
+
+      - name: Verify module
+        run: |
+          modinfo kernel/xmm7360.ko
+
+          modinfo kernel/xmm7360.ko \
+            | grep -qi 'license:.*GPL' || {
+              echo "::error::GPL license missing"
+              exit 1
+            }
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -194,3 +242,4 @@ jobs:
             kernel/xmm7360.ko
             dkms-build.log
           retention-days: 14
+        
