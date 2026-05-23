@@ -1,55 +1,73 @@
 #!/bin/bash
 # /usr/lib/systemd/system-sleep/xmm7360
 #
-# Bring the LTE data connection DOWN cleanly before the system sleeps, and
-# allow it to come back AFTER resume.
+# Make the modem SAFE to suspend/hibernate by ensuring NO userspace process
+# holds its char/tty devices open before the kernel tears the driver down.
 #
-# Why: the xmm7360 is a PCIe modem whose data path uses live DMA rings. If the
-# system enters S3/S4 with an ACTIVE connection, the in-flight DMA / armed ring
-# descriptors do not survive the power transition and the device faults on
-# resume (kernel panic). Suspending while IDLE is safe. So we force the idle
-# state first — disconnect here, while the device is fully alive and can be
-# torn down cleanly in userspace, instead of crashing inside a kernel PM
-# callback.
+# Why this is required:
+#   The PCIe modem's data path uses live DMA rings, and the driver's PM
+#   notifier unbinds the driver (pci_unregister_driver) across the sleep
+#   transition to avoid resuming with stale device state. BUT the driver's
+#   per-channel cdev and tty_port structs are embedded in a queue_pair that
+#   the teardown frees/zeroes. If ModemManager (which keeps the ttyXMM AT
+#   ports open) or pppd / open_xdatachannel still hold those fds when the
+#   unbind runs, their later close() walks freed kernel structures —
+#   corrupting a cdev list (-> kernel oops in cdev_put/cd_forget) or
+#   deadlocking in tty_release on a zeroed mutex (-> hibernate freeze fails,
+#   UI wedges). Cold-boot suspend works only because nothing holds the ports
+#   yet; after a few minutes of real use MM/pppd do, and it crashes.
+#
+#   userspace system-sleep hooks run BEFORE the kernel PM notifier, so this
+#   is the correct place to release every fd first. We stop ModemManager so
+#   it closes the tty ports, kill any pppd/tool still holding a port, and
+#   only THEN let the kernel unbind cleanly.
 #
 # systemd calls this as:  xmm7360 {pre|post} {suspend|hibernate|...}
 
 phase="$1"
-# action="$2"   # suspend / hibernate / hybrid-sleep / suspend-then-hibernate
-
 log() { logger -t xmm7360-sleep "$*"; }
 
 case "$phase" in
     pre)
-        log "pre-sleep: bringing modem connection down before suspend"
+        log "pre-sleep: releasing all modem fds before kernel unbind"
 
-        # 1. Bring down any active NetworkManager gsm/modem connection.
-        #    (NM names vary, so match by type=gsm.)
+        # 1. Bring down any active gsm/modem NM connection (drops pppd cleanly).
         for c in $(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
                    | awk -F: '$2=="gsm"{print $1}'); do
             log "  nmcli down: $c"
-            nmcli connection down "$c" 2>/dev/null || true
+            timeout 8 nmcli connection down "$c" 2>/dev/null || true
         done
 
-        # 2. Belt-and-suspenders: tell ModemManager to disconnect any modem,
-        #    so the kernel data-path queue pair is quiesced (rings drained).
-        for m in $(mmcli -L 2>/dev/null | grep -oE '/Modem/[0-9]+' | tr -d '\n' \
-                   | grep -oE '[0-9]+$'); do
-            log "  mmcli disconnect modem $m"
-            timeout 8 mmcli -m "$m" --simple-disconnect 2>/dev/null || true
-        done
+        # 2. Stop ModemManager so it CLOSES the ttyXMM AT ports. This is the
+        #    key step: while MM runs it keeps those ports open, and the kernel
+        #    unbind would free them out from under it. Stopping MM (and waiting
+        #    for it to exit) guarantees those fds are closed.
+        if systemctl is-active --quiet ModemManager; then
+            log "  stopping ModemManager (closes ttyXMM ports)"
+            timeout 15 systemctl stop ModemManager 2>/dev/null || true
+        fi
 
-        # 3. Give the kernel a moment to finish tearing down the DMA rings
-        #    before power is pulled.
+        # 3. Kill anything else still holding a modem device open.
+        for proc in pppd open_xdatachannel; do
+            if pgrep -x "$proc" >/dev/null 2>&1; then
+                log "  killing $proc (still holding a port)"
+                pkill -TERM -x "$proc" 2>/dev/null || true
+            fi
+        done
         sleep 1
-        log "pre-sleep: modem idle, safe to suspend"
+        pkill -KILL -x pppd 2>/dev/null || true
+        pkill -KILL -x open_xdatachannel 2>/dev/null || true
+
+        # 4. Give the kernel a moment to process the closes before it unbinds.
+        sleep 1
+        log "pre-sleep: all modem fds released, safe to suspend"
         ;;
 
     post)
-        log "post-resume: modem will reconnect via autoconnect / rescan service"
-        # Nudge ModemManager to re-scan in case it dropped the modem; the
-        # xmm7360-rescan service + NM autoconnect handle the actual reconnect.
-        timeout 10 mmcli -S 2>/dev/null || true
+        log "post-resume: restarting ModemManager to re-probe the modem"
+        # The kernel re-probed the device on resume (PM notifier rebind).
+        # Restart MM so it re-detects the fresh modem and autoconnect resumes.
+        timeout 15 systemctl start ModemManager 2>/dev/null || true
         ;;
 esac
 
