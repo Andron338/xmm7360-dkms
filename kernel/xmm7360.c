@@ -50,6 +50,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kobject.h>
+#include <linux/kref.h>
 #include <linux/netdevice.h>
 #include <linux/pci.h>
 #include <linux/poll.h>
@@ -196,6 +197,7 @@ struct td_ring {
 
 struct queue_pair {
 	struct xmm_dev *xmm;
+	bool registered;  /* cdev/tty added; slot in use */
 	/* Stall-detection counters (read by xmm7360_watchdog) */
 	unsigned long tx_bytes;
 	unsigned long rx_bytes;
@@ -248,6 +250,13 @@ struct xmm_dev {
 	int error;
 	int card_num;
 	int num_ttys;
+
+	/* Refcount: the driver holds one ref (probe..remove); each
+	 * registered cdev and tty port holds one. xmm (and its embedded
+	 * cdev/tty_port structs) is freed only when the LAST ref drops,
+	 * i.e. after the last userspace fd closes -- so a close() that
+	 * races the PM-notifier unbind can never touch freed memory. */
+	struct kref kref;
 };
 
 struct mux_bounds {
@@ -1334,31 +1343,48 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 	xmm7360_destroy_net(xmm);
 
 	for (i = 0; i < 8; i++) {
-		if (xmm->qp[i].xmm) {
-			if (xmm->qp[i].cdev.owner) {
-				cdev_del(&xmm->qp[i].cdev);
-				device_unregister(&xmm->qp[i].dev);
-			}
-			if (xmm->qp[i].port.ops) {
-				/*
-				 * Force-hang up any still-open TTY before
-				 * unregistering. ModemManager (and pppd) keep the
-				 * AT ports open; tty_unregister_device() removes the
-				 * node but does NOT drop the module reference an open
-				 * handle holds. Without this hangup those refs leak
-				 * across a teardown that runs while a port is open
-				 * (e.g. hibernation recovery), leaving refcnt > 0 and
-				 * "module in use" even though no process lists the
-				 * node in lsof. The hangup makes the TTY layer close
-				 * the handle and release the reference.
-				 */
-				tty_port_tty_hangup(&xmm->qp[i].port, false);
-				tty_unregister_device(xmm7360_tty_driver,
-						      xmm->qp[i].tty_index);
-				tty_port_destroy(&xmm->qp[i].port);
-			}
+		struct queue_pair *qp = &xmm->qp[i];
+
+		if (!qp->registered)
+			continue;
+
+		if (qp->cdev.owner) {
+			/*
+			 * cdev_del() + device_del() remove the node now, but the
+			 * embedded struct device keeps its reference while a fd
+			 * is open; put_device() only triggers our release
+			 * callback (which kref_puts xmm) once that fd closes. We
+			 * must NOT free/zero qp here -- the open fd still points
+			 * at this cdev. The kref on xmm keeps the memory alive.
+			 */
+			cdev_del(&qp->cdev);
+			device_del(&qp->dev);
+			put_device(&qp->dev);
+			qp->cdev.owner = NULL;
 		}
-		memset(&xmm->qp[i], 0, sizeof(struct queue_pair));
+		if (qp->port.ops) {
+			/*
+			 * Hang up any open tty (wakes ModemManager/pppd blocked
+			 * in read), unregister the node, then tty_port_put()
+			 * drops the port's init reference. If a tty is still
+			 * open the port (and via .destruct, our xmm ref) survives
+			 * until that fd's tty_release completes -- so the close
+			 * path never touches freed memory.
+			 */
+			tty_port_tty_hangup(&qp->port, false);
+			tty_unregister_device(xmm7360_tty_driver, qp->tty_index);
+			qp->port.ops = NULL;
+			tty_port_put(&qp->port);
+		}
+		/*
+		 * Mark the slot free for any in-place rebuild, but DO NOT
+		 * memset qp: an open fd may still reference the embedded
+		 * cdev/tty_port, and qp->xmm must stay valid for the late
+		 * release/.destruct callbacks to reach xmm. The kref keeps
+		 * the whole struct alive until those callbacks run.
+		 */
+		qp->registered = false;
+		qp->open = 0;
 	}
 	xmm7360_cmd_ring_free(xmm);
 }
@@ -1383,11 +1409,26 @@ static void xmm7360_remove(struct pci_dev *dev)
 	pci_release_region(dev, 0);
 	pci_release_region(dev, 2);
 	pci_disable_device(dev);
+	/* Drop the driver's reference. xmm is freed (xmm7360_free) only when
+	 * every cdev/tty reference has also dropped -- i.e. after the last
+	 * userspace fd closes. A close() racing this unbind is now safe. */
+	kref_put(&xmm->kref, xmm7360_free);
+}
+
+/* Actual free, invoked only when the last reference (driver + every open
+ * cdev/tty) has been dropped. */
+static void xmm7360_free(struct kref *kref)
+{
+	struct xmm_dev *xmm = container_of(kref, struct xmm_dev, kref);
 	kfree(xmm);
 }
 
 static void xmm7360_cdev_dev_release(struct device *dev)
 {
+	struct queue_pair *qp = dev_get_drvdata(dev);
+
+	if (qp && qp->xmm)
+		kref_put(&qp->xmm->kref, xmm7360_free);
 }
 
 static int xmm7360_tty_open(struct tty_struct *tty, struct file *filp)
@@ -1506,10 +1547,19 @@ static void xmm7360_tty_port_dtr_rts(struct tty_port *tport, int raise)
 		xmm7360_qp_stop(qp);
 }
 
+static void xmm7360_tty_port_destruct(struct tty_port *port)
+{
+	struct queue_pair *qp = container_of(port, struct queue_pair, port);
+
+	if (qp->xmm)
+		kref_put(&qp->xmm->kref, xmm7360_free);
+}
+
 static const struct tty_port_operations xmm7360_tty_port_ops = {
 	.activate = xmm7360_tty_port_activate,
 	.shutdown = xmm7360_tty_port_shutdown,
 	.dtr_rts  = xmm7360_tty_port_dtr_rts,
+	.destruct = xmm7360_tty_port_destruct,
 };
 
 /*
@@ -1583,6 +1633,10 @@ static int xmm7360_create_tty(struct xmm_dev *xmm, int num)
 		tty_port_destroy(&qp->port);
 		return ret;
 	}
+	/* This tty port now pins xmm until its .destruct fires (after the
+	 * last tty fd closes). */
+	kref_get(&xmm->kref);
+	qp->registered = true;
 
 	return 0;
 }
@@ -1608,6 +1662,10 @@ static int xmm7360_create_cdev(struct xmm_dev *xmm, int num, const char *name,
 		dev_err(xmm->dev, "cdev_device_add: %d\n", ret);
 		return ret;
 	}
+	/* This cdev now pins xmm until its device release callback fires
+	 * (after the last fd on it closes). */
+	kref_get(&xmm->kref);
+	qp->registered = true;
 	return 0;
 }
 
@@ -1867,6 +1925,7 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return -ENOMEM;
 	}
 
+	kref_init(&xmm->kref);   /* driver holds the first reference */
 	xmm->pci_dev = dev;
 	xmm->dev = &dev->dev;
 
