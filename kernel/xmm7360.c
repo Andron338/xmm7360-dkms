@@ -2065,22 +2065,35 @@ static int xmm7360_pm_notify(struct notifier_block *nb, unsigned long mode,
 			     void *unused)
 {
 	switch (mode) {
+	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
-		/* Unbind before the image is written / before restore. */
+		/*
+		 * Unbind the driver before ANY sleep transition (S3 or S4).
+		 * pci_unregister_driver() runs the full .remove teardown
+		 * synchronously here -- the in-kernel equivalent of
+		 * "modprobe -r" -- so the device is left with no live DMA
+		 * rings, no armed IRQ, no stale state to corrupt across the
+		 * power cycle. The xmm7360-sleep hook has already dropped the
+		 * data connection in userspace before we get here, so this
+		 * teardown runs from the idle state (no pppd holding a port,
+		 * refcount at baseline) and cannot wedge.
+		 */
 		if (xmm7360_pci_registered) {
 			pci_unregister_driver(&xmm7360_driver);
 			xmm7360_pci_registered = false;
 		}
 		break;
+	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
-		/* Re-bind: re-probe the device from scratch (cold-boot path). */
+		/* Re-bind on wake: re-probe from scratch (== "modprobe", the
+		 * cold-boot path, which is known to work). */
 		if (!xmm7360_pci_registered) {
 			if (pci_register_driver(&xmm7360_driver) == 0)
 				xmm7360_pci_registered = true;
 			else
-				pr_err("xmm7360: failed to re-register after hibernation\n");
+				pr_err("xmm7360: failed to re-register after resume\n");
 		}
 		break;
 	}
