@@ -14,7 +14,7 @@ on:
 
 jobs:
   # ─────────────────────────────────────────────────────────────
-  # Stage 1: Build and lint package
+  # Stage 1: Build + lint package
   # ─────────────────────────────────────────────────────────────
   package:
     name: makepkg + namcap
@@ -53,22 +53,20 @@ jobs:
 
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-      - name: namcap PKGBUILD
+      - name: Run namcap
         run: |
           cd "$GITHUB_WORKSPACE"
 
           namcap PKGBUILD 2>&1 | tee namcap.log || true
 
-          echo "namcap completed (warnings allowed for DKMS packages)"
-
-      - name: shellcheck scripts
+      - name: Shellcheck scripts
         run: |
           cd "$GITHUB_WORKSPACE"
 
           for f in *.install xmm7360-reset; do
             [ -f "$f" ] || continue
 
-            echo "── checking $f ──"
+            echo "Checking $f"
 
             shellcheck -s bash -S warning "$f" || true
           done
@@ -109,7 +107,7 @@ jobs:
           retention-days: 14
 
   # ─────────────────────────────────────────────────────────────
-  # Stage 2: DKMS compile tests
+  # Stage 2: DKMS kernel compile tests
   # ─────────────────────────────────────────────────────────────
   dkms-build:
     name: dkms build (${{ matrix.kernel }})
@@ -137,7 +135,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed \
             base-devel \
@@ -147,73 +145,95 @@ jobs:
             sudo \
             dkms
 
-      - name: Install kernel headers
+      - name: Install kernel + headers
         run: |
-          pacman -S --noconfirm --needed "${KPKG}-headers"
+          pacman -S --noconfirm --needed \
+            "${KPKG}" \
+            "${KPKG}-headers"
 
-      - name: Resolve kernel version
+      - name: Detect kernel version
         id: kver
         run: |
+          echo "Installed modules:"
+          ls -1 /usr/lib/modules/
+
           case "$KPKG" in
             linux)
-              pattern='^[0-9].*-arch'
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep -E '[0-9].*-arch[0-9-]*$' \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
               ;;
+
             linux-lts)
-              pattern='-lts'
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep lts \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
               ;;
+
             linux-zen)
-              pattern='-zen'
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep zen \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
               ;;
+
             linux-hardened)
-              pattern='-hardened'
+              KVER=$(find /usr/lib/modules -maxdepth 1 -type d \
+                | grep hardened \
+                | xargs -n1 basename \
+                | sort -V \
+                | tail -1)
               ;;
           esac
 
-          KVER=$(ls -1 /usr/lib/modules/ \
-            | grep -E "$pattern" \
-            | sort -V \
-            | tail -1)
+          echo "Detected KVER=$KVER"
 
           if [ -z "$KVER" ]; then
             echo "::error::Could not determine kernel version"
-            ls -la /usr/lib/modules/
             exit 1
           fi
 
           if [ ! -d "/usr/lib/modules/$KVER/build" ]; then
-            echo "::error::Kernel headers missing"
+            echo "::error::Missing build directory"
+            ls -la "/usr/lib/modules/$KVER"
             exit 1
           fi
 
           echo "kver=$KVER" >> "$GITHUB_OUTPUT"
 
-      - name: Clean previous builds
+      - name: Clean old artifacts
         run: |
           rm -f kernel/*.ko || true
 
           make -C kernel clean || true
 
-      - name: DKMS-style module build
+      - name: Build module
         run: |
           make -C /usr/lib/modules/${{ steps.kver.outputs.kver }}/build \
             M="$PWD/kernel" \
             modules 2>&1 | tee dkms-build.log
 
           test -f kernel/xmm7360.ko || {
-            echo "::error::Module was not built"
+            echo "::error::Module build failed"
             exit 1
           }
 
-      - name: Verify module metadata
+      - name: Verify module
         run: |
           modinfo kernel/xmm7360.ko
 
-          modinfo kernel/xmm7360.ko | grep -qi 'license:.*GPL' || {
-            echo "::error::GPL license missing"
-            exit 1
-          }
+          modinfo kernel/xmm7360.ko \
+            | grep -qi 'license:.*GPL' || {
+              echo "::error::GPL license missing"
+              exit 1
+            }
 
-      - name: Upload module artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -222,3 +242,4 @@ jobs:
             kernel/xmm7360.ko
             dkms-build.log
           retention-days: 14
+        
