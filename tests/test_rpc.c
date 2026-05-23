@@ -76,9 +76,9 @@ static void test_fcc_unlock_id_distinct(void)
 {
     /* FCC unlock uses its own command — verify it doesn't collide
      * with the init sequence commands */
-    ASSERT_NE(XMM_CMD_CsiFccLockVerChallenge, XMM_CMD_UtaMsCbsInit);
-    ASSERT_NE(XMM_CMD_CsiFccLockVerChallenge, XMM_CMD_UtaMsNetOpen);
-    ASSERT_NE(XMM_CMD_CsiFccLockVerChallenge, XMM_CMD_UtaMsSimOpenReq);
+    ASSERT_NE(XMM_CMD_CsiFccLockVerChallengeReq, XMM_CMD_UtaMsCbsInit);
+    ASSERT_NE(XMM_CMD_CsiFccLockVerChallengeReq, XMM_CMD_UtaMsNetOpen);
+    ASSERT_NE(XMM_CMD_CsiFccLockVerChallengeReq, XMM_CMD_UtaMsSimOpenReq);
 }
 
 /* ── Unsolicited message table ────────────────────────────────────────────── */
@@ -90,7 +90,7 @@ static void test_fcc_unlock_id_distinct(void)
 static void test_unsol_signal_ind_code(void)
 {
     /* UtaMsNetRadioSignalIndCb must be 0x05a — we log it in handle_unsolicited */
-    ASSERT_EQ(XMM_UNSOL_UtaMsNetRadioSignalIndCb, 0x05au);
+    ASSERT_EQ(XMM_UNSOL_UtaMsNetRadioSignalIndCb, 0x05a);
 }
 
 static void test_unsol_attach_allowed_code(void)
@@ -118,7 +118,7 @@ static void test_max_msg_size(void)
 {
     /* XMM_MAX_MSG must be large enough for any real modem message.
      * The Python original used 131072; our C port must match. */
-    ASSERT_EQ(XMM_MAX_MSG, 131072u);
+    ASSERT_EQ(XMM_MAX_MSG, 131072);
 }
 
 static void test_msg_type_enum_values(void)

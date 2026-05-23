@@ -233,6 +233,8 @@
 #define XMM_CMD_RPCGetAPIParamChangedBitmap              0x1C8
 
 /* Unsolicited codes referenced internally */
+#define XMM_UNSOL_UtaMsNetSingleShotRadioSignalReportingRspCb 0x056
+#define XMM_UNSOL_UtaMsNetRadioSignalIndCb               0x05A
 #define XMM_UNSOL_UtaMsNetIsAttachAllowedIndCb           0x06C
 #define XMM_UNSOL_UtaModeSetRspCb                        0x12D
 #define XMM_UNSOL_CsiFccLockQueryRspCb                   0x18F
