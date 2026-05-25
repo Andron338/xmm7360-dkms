@@ -314,7 +314,7 @@ struct xmm_net {
 static void xmm7360_set_error(struct xmm_dev *xmm, int err)
 {
 	int i;
-	xmm->error = err;
+	WRITE_ONCE(xmm->error, err);
 	wake_up(&xmm->wq);
 	for (i = 0; i < 8; i++) {
 		if (xmm->qp[i].xmm == xmm)   /* qp is initialised */
@@ -340,7 +340,7 @@ static void xmm7360_emit_uevent(struct xmm_dev *xmm, const char *state)
 
 static void xmm7360_poll(struct xmm_dev *xmm)
 {
-	bool was_ok = !xmm->error;
+	bool was_ok = !READ_ONCE(xmm->error);
 
 	/* cp may be NULL during recovery_work (dev_deinit freed it) */
 	if (!xmm->cp)
@@ -356,12 +356,18 @@ static void xmm7360_poll(struct xmm_dev *xmm)
 	}
 
 	/* On transition OK -> error, schedule kernel-level recovery */
-	if (was_ok && xmm->error)
+	if (was_ok && READ_ONCE(xmm->error))
 		schedule_work(&xmm->recovery_work);
 }
 
 static void xmm7360_ding(struct xmm_dev *xmm, int bell)
 {
+	/* cp is NULL between cmd_ring_free() and cmd_ring_init() during
+	 * recovery, and after remove(). Process-context callers (qp_write,
+	 * net_flush) check xmm->error but that check and this deref are not
+	 * atomic, so guard explicitly. */
+	if (!xmm->cp)
+		return;
 	if (xmm->cp->status.asleep)
 		xmm->bar0[BAR0_WAKEUP] = 1;
 	xmm->bar0[BAR0_DOORBELL] = bell;
@@ -372,13 +378,13 @@ static int xmm7360_cmd_ring_wait(struct xmm_dev *xmm)
 {
 	// Wait for all commands to complete
 	int ret = wait_event_interruptible_timeout(
-		xmm->wq, (xmm->cp->c_rptr == xmm->cp->c_wptr) || xmm->error,
+		xmm->wq, (xmm->cp->c_rptr == xmm->cp->c_wptr) || READ_ONCE(xmm->error),
 		msecs_to_jiffies(1000));
 	if (ret == 0)
 		return -ETIMEDOUT;
 	if (ret < 0)
 		return ret;
-	return xmm->error;
+	return READ_ONCE(xmm->error);
 }
 
 static int xmm7360_cmd_ring_execute(struct xmm_dev *xmm, u8 cmd, u8 parm,
@@ -386,8 +392,8 @@ static int xmm7360_cmd_ring_execute(struct xmm_dev *xmm, u8 cmd, u8 parm,
 {
 	u8 wptr = xmm->cp->c_wptr;
 	u8 new_wptr = (wptr + 1) % CMD_RING_SIZE;
-	if (xmm->error)
-		return xmm->error;
+	if (READ_ONCE(xmm->error))
+		return READ_ONCE(xmm->error);
 	if (new_wptr == xmm->cp->c_rptr) // ring full
 		return -EAGAIN;
 
@@ -527,7 +533,7 @@ static void xmm7360_td_ring_destroy(struct xmm_dev *xmm, u8 ring_id)
 	 * path (pppd stuck in D-state, module refcount stuck, modprobe -r
 	 * fails "in use"). In the error case just reclaim the DMA memory.
 	 */
-	if (!xmm->error)
+	if (!READ_ONCE(xmm->error))
 		xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
 
 	for (i = 0; i < depth; i++) {
@@ -606,7 +612,7 @@ static struct queue_pair *xmm7360_init_qp(struct xmm_dev *xmm, int num,
 
 	qp->xmm = xmm;
 	qp->num = num;
-	qp->open = 0;
+	WRITE_ONCE(qp->open, 0);
 	qp->depth = depth;
 	qp->page_size = page_size;
 
@@ -622,11 +628,11 @@ static int xmm7360_qp_start(struct queue_pair *qp)
 
 	mutex_lock(&qp->lock);
 
-	if (qp->open) {
+	if (READ_ONCE(qp->open)) {
 		ret = -EBUSY;
 	} else {
 		ret = 0;
-		qp->open = 1;
+		WRITE_ONCE(qp->open, 1);
 
 		ret = xmm7360_td_ring_create(xmm, qp->num * 2, qp->depth,
 					     qp->page_size);
@@ -655,11 +661,11 @@ static int xmm7360_qp_stop(struct queue_pair *qp)
 	int ret = 0;
 
 	mutex_lock(&qp->lock);
-	if (!qp->open) {
+	if (!READ_ONCE(qp->open)) {
 		ret = -ENODEV;
 	} else {
 		ret = 0;
-		qp->open = 0;
+		WRITE_ONCE(qp->open, 0);
 
 		xmm7360_td_ring_destroy(xmm, qp->num * 2);
 		xmm7360_td_ring_destroy(xmm, qp->num * 2 + 1);
@@ -679,8 +685,8 @@ static size_t xmm7360_qp_write(struct queue_pair *qp, const char *buf,
 {
 	struct xmm_dev *xmm = qp->xmm;
 	int page_size = qp->xmm->td_ring[qp->num * 2].page_size;
-	if (xmm->error)
-		return xmm->error;
+	if (READ_ONCE(xmm->error))
+		return READ_ONCE(xmm->error);
 	if (!xmm7360_qp_can_write(qp))
 		return 0;
 	if (size > page_size)
@@ -771,11 +777,11 @@ ssize_t xmm7360_cdev_read(struct file *file, char __user *buf, size_t size,
 	struct td_ring *ring = &xmm->td_ring[qp->num * 2 + 1];
 	int idx, nread, ret;
 	ret = wait_event_interruptible(qp->wq,
-				       xmm7360_qp_has_data(qp) || xmm->error);
+				       xmm7360_qp_has_data(qp) || READ_ONCE(xmm->error));
 	if (ret < 0)
 		return ret;
-	if (xmm->error)
-		return xmm->error;
+	if (READ_ONCE(xmm->error))
+		return READ_ONCE(xmm->error);
 
 	idx = ring->last_handled;
 	nread = ring->tds[idx].length;
@@ -799,7 +805,7 @@ static unsigned int xmm7360_cdev_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &qp->wq, wait);
 
-	if (qp->xmm->error)
+	if (READ_ONCE(qp->xmm->error))
 		return POLLHUP;
 
 	if (xmm7360_qp_has_data(qp))
@@ -1117,6 +1123,13 @@ static void xmm7360_net_mux_handle_frame(struct xmm_net *xn, u8 *data, int len)
 	struct sk_buff *skb;
 	void *p;
 	u8 ip_version;
+	size_t adth_offset, bounds_offset, bounds_end;
+
+	/* Need at least a full first header */
+	if (len < (int)sizeof(struct mux_first_header)) {
+		dev_err(xn->xmm->dev, "mux frame too short: %d\n", len);
+		return;
+	}
 
 	first = (void *)data;
 	if (ntohl(first->tag) == 'ACBH')
@@ -1127,22 +1140,54 @@ static void xmm7360_net_mux_handle_frame(struct xmm_net *xn, u8 *data, int len)
 		return;
 	}
 
-	adth = (void *)(&data[first->next]);
+	/* Validate first->next points inside the buffer and leaves room for
+	 * at least a mux_next_header + 4 bytes of ADTH payload. */
+	adth_offset = first->next;
+	if (adth_offset + sizeof(struct mux_next_header) + 4 > (size_t)len) {
+		dev_err(xn->xmm->dev, "mux: ADTH offset %zu out of bounds (len %d)\n",
+			adth_offset, len);
+		return;
+	}
+
+	adth = (void *)(&data[adth_offset]);
 	if (ntohl(adth->tag) != 'ADTH') {
 		dev_err(xn->xmm->dev, "Unexpected tag %x, expected ADTH\n",
 			adth->tag);
 		return;
 	}
 
+	/* adth->length must fit the minimum header + at least 4 bytes */
+	if (adth->length < sizeof(struct mux_next_header) + 4) {
+		dev_err(xn->xmm->dev, "mux: ADTH length %u too small\n", adth->length);
+		return;
+	}
+
 	n_packets = (adth->length - sizeof(struct mux_next_header) - 4) /
 		    sizeof(struct mux_bounds);
 
-	bounds =
-		(void *)&data[first->next + sizeof(struct mux_next_header) + 4];
+	/* Bounds array must fit entirely within the received buffer */
+	bounds_offset = adth_offset + sizeof(struct mux_next_header) + 4;
+	bounds_end = bounds_offset + (size_t)n_packets * sizeof(struct mux_bounds);
+	if (bounds_end > (size_t)len) {
+		dev_err(xn->xmm->dev, "mux: bounds array [%zu..%zu] exceeds frame len %d\n",
+			bounds_offset, bounds_end, len);
+		return;
+	}
+
+	bounds = (void *)&data[bounds_offset];
 
 	for (i = 0; i < n_packets; i++) {
 		if (!bounds[i].length)
 			continue;
+
+		/* Each packet must lie entirely within the received buffer */
+		if ((size_t)bounds[i].offset + bounds[i].length > (size_t)len) {
+			dev_err(xn->xmm->dev,
+				"mux: packet %d [%u..%u] out of bounds (len %d)\n",
+				i, bounds[i].offset,
+				bounds[i].offset + bounds[i].length, len);
+			return;
+		}
 
 		skb = dev_alloc_skb(bounds[i].length + NET_IP_ALIGN);
 		if (!skb)
@@ -1300,7 +1345,7 @@ static irqreturn_t xmm7360_irq0(int irq, void *dev_id)
 	 * xmm->cp is the canonical "we have a working device" sentinel —
 	 * it is NULL after cmd_ring_free() and set again by cmd_ring_init().
 	 * The old `if (xmm->td_ring)` check was always true (array address). */
-	if (xmm->cp && !xmm->error) {
+	if (xmm->cp && !READ_ONCE(xmm->error)) {
 		if (xmm->net)
 			xmm7360_net_poll(xmm);
 
@@ -1308,11 +1353,11 @@ static irqreturn_t xmm7360_irq0(int irq, void *dev_id)
 			qp = &xmm->qp[id];
 
 			/* wake _cdev_read() */
-			if (qp->open)
+			if (READ_ONCE(qp->open))
 				wake_up(&qp->wq);
 
 			/* tty tasks */
-			if (qp->open && qp->port.ops) {
+			if (READ_ONCE(qp->open) && qp->port.ops) {
 				xmm7360_tty_poll_qp(qp);
 				if (qp->tty_needs_wake &&
 				    xmm7360_qp_can_write(qp) && qp->port.tty) {
@@ -1384,7 +1429,7 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 		 * the whole struct alive until those callbacks run.
 		 */
 		qp->registered = false;
-		qp->open = 0;
+		WRITE_ONCE(qp->open, 0);
 	}
 	xmm7360_cmd_ring_free(xmm);
 }
@@ -1402,6 +1447,19 @@ static void xmm7360_remove(struct pci_dev *dev)
 	del_timer_sync(&xmm->watchdog);
 #endif
 	cancel_work_sync(&xmm->recovery_work);
+
+	/*
+	 * Disable the IRQ BEFORE dev_deinit.  dev_deinit calls
+	 * cmd_ring_free() which sets xmm->cp = NULL and destroy_net()
+	 * which sets xmm->net = NULL.  The IRQ handler reads both
+	 * pointers; if it fires after either NULL assignment but before
+	 * free_irq() it will deref a NULL/freed pointer and panic.
+	 * disable_irq() waits for any in-flight handler to finish before
+	 * returning, then masks the line.  free_irq() below permanently
+	 * tears down the vector.
+	 */
+	if (xmm->irq)
+		disable_irq(xmm->irq);
 
 	xmm7360_dev_deinit(xmm);
 
@@ -1545,7 +1603,7 @@ static void xmm7360_tty_port_dtr_rts(struct tty_port *tport, int raise)
 #endif
 {
 	struct queue_pair *qp = container_of(tport, struct queue_pair, port);
-	if (!raise && qp->open)
+	if (!raise && READ_ONCE(qp->open))
 		xmm7360_qp_stop(qp);
 }
 
@@ -1676,7 +1734,7 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 	int ret, i;
 	u32 status;
 
-	xmm->error = 0;
+	WRITE_ONCE(xmm->error, 0);
 	xmm->num_ttys = 0;
 
 	status = xmm->bar2[0];
@@ -1755,7 +1813,7 @@ static void xmm7360_watchdog(struct timer_list *t)
 	struct net_device *dev = xmm->netdev;
 	unsigned long tx, rx;
 
-	if (!dev || xmm->error || work_pending(&xmm->recovery_work)) {
+	if (!dev || READ_ONCE(xmm->error) || work_pending(&xmm->recovery_work)) {
 		/* not running or recovery already in flight */
 		xmm->wd_stall_count   = 0;
 		xmm->wd_last_tx_bytes = 0;
@@ -1847,7 +1905,7 @@ static int xmm7360_do_rebuild(struct xmm_dev *xmm)
 
 	xmm7360_dev_deinit(xmm);
 	msleep(100);            /* let DMA settle */
-	xmm->error = 0;
+	WRITE_ONCE(xmm->error, 0);
 
 	ret = xmm7360_dev_init(xmm);
 	if (ret < 0) {
@@ -1975,6 +2033,7 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	ret = request_irq(xmm->irq, xmm7360_irq0, 0, "xmm7360", xmm);
 	if (ret) {
 		dev_err(&(dev->dev), "request_irq\n");
+		xmm->irq = 0;  /* mark as not requested so fail path skips disable_irq */
 		goto fail;
 	}
 
@@ -1985,6 +2044,15 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return 0;
 
 fail:
+	/*
+	 * Disable the IRQ before dev_deinit for the same reason as in
+	 * xmm7360_remove: dev_deinit nulls xmm->cp and xmm->net, and the
+	 * IRQ handler dereferences both. xmm7360_remove() will call
+	 * free_irq() to finish the teardown, but we must mask the line here
+	 * first so no handler fires in the window between deinit and remove.
+	 */
+	if (xmm->irq)
+		disable_irq(xmm->irq);
 	xmm7360_dev_deinit(xmm);
 	xmm7360_remove(dev);
 	return ret;
@@ -1992,117 +2060,126 @@ fail:
 
 #ifdef CONFIG_PM_SLEEP
 /*
- * Suspend / hibernate-freeze.
+ * S3 (suspend-to-RAM / s2idle) suspend/resume.
  *
- * The modem firmware does NOT survive a power transition: on resume
- * its DMA rings, BAR state and command ring are stale, and touching
- * them panics. So the only safe strategy is to treat the device as
- * GONE the moment we suspend. We set the error flag FIRST (while the
- * hardware is still alive and responsive) — this stops all readers,
- * wakes any waiters, and ensures no ring/command path runs during or
- * after the transition. Then we quiesce the netdev and timers.
+ * The XMM7360 stays powered across S3: its firmware, DMA rings and BAR
+ * state all survive.  We therefore do NOT tear down the rings or set the
+ * error flag here.  We simply quiesce the data path (stop TX queue, detach
+ * netdev, cancel timers/work) and let the hardware coast.  On resume we
+ * re-attach and restart the queue.
  *
- * We deliberately do NOT tear down the cdev/tty devices here: the
- * device nodes stay registered so userspace handles are not yanked
- * mid-suspend. The full hardware reset happens on resume via a
- * userspace module reload (see xmm7360_resume).
- */
-/*
- * S3 suspend. The device stays powered, so we just quiesce: stop the
- * netdev queue, detach it, cancel the data-path timer and init work.
- * We do NOT set the error flag or tear down rings -- the device is
- * expected to survive S3, and resume re-attaches. (Hibernation/S4 never
- * reaches here: the PM notifier unbinds the driver before the image is
- * written.)
+ * S4 (hibernation) is handled exclusively by xmm7360_pm_notifier, which
+ * unbinds the driver (pci_unregister_driver) before the image is written and
+ * re-probes after.  The .freeze/.thaw/.restore callbacks are intentionally
+ * left unset: by the time they would run the driver is already unbound.
+ *
+ * IMPORTANT: the PM notifier must NOT call pci_unregister_driver() on
+ * PM_SUSPEND_PREPARE (S3) -- that would tear down netdev/tty before
+ * xmm7360_suspend() runs, causing NULL-deref / use-after-free wedges.
  */
 static int xmm7360_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
+	/*
+	 * Stop the watchdog timer FIRST.  It fires every 30 s and on expiry
+	 * can call schedule_work(&xmm->recovery_work).  If it fires between
+	 * our cancel_work_sync() and the actual sleep, recovery_work gets
+	 * re-queued and runs during or after resume against half-quiesced
+	 * state.  del_timer_sync() guarantees the callback has finished and
+	 * will not re-fire.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	timer_delete_sync(&xmm->watchdog);
+#else
+	del_timer_sync(&xmm->watchdog);
+#endif
+
+	/*
+	 * Cancel any in-flight or pending recovery/init work AFTER the
+	 * watchdog is stopped (so it cannot re-queue recovery_work between
+	 * the two cancel calls).  cancel_work_sync() waits for a running
+	 * instance to finish.
+	 */
+	cancel_work_sync(&xmm->recovery_work);
+	cancel_work_sync(&xmm->init_work);
+
 	if (xmm->netdev) {
 		netif_stop_queue(xmm->netdev);
 		netif_device_detach(xmm->netdev);
 	}
+	/* Cancel the TX-coalescing deadline timer AFTER stopping the queue
+	 * so no new skbs are enqueued between cancel and queue stop. */
 	if (xmm->net)
 		hrtimer_cancel(&xmm->net->deadline);
-	cancel_work_sync(&xmm->init_work);
 
 	dev_info(dev, "xmm7360: suspended (S3)\n");
 	return 0;
 }
 
 /*
- * Normal suspend/resume (S3): hardware stayed powered, DMA coherent
- * memory is still valid. Re-attach the netdev, then emit "resumed" so
- * the udev rule re-runs xmm7360-init (RPC re-wake) + xmm7360-signal.
- * No in-callback teardown — recovery policy stays in userspace.
- */
-/*
- * Resume / hibernate-thaw / hibernate-restore.
- *
- * CRITICAL: do not touch the hardware here. The firmware was power-
- * cycled and all device state (DMA rings, command ring, BAR2) is
- * stale; reattaching the netdev or reading any ring would dereference
- * garbage and panic (observed: reliable panic on resume). The device
- * is already in the error state (set in suspend). The ONLY reliable
- * way to recover this modem is a full re-probe, which we delegate to
- * userspace: emit "failed" so the udev rule starts
- * xmm7360-recovery.service, which does modprobe -r / modprobe once the
- * system is fully back up. No hardware access, no netif_device_attach,
- * no in-callback rebuild.
- */
-/*
- * S3 resume. The device stayed powered across suspend, so unlike S4
- * (handled by the PM notifier via unbind/rebind) we do not tear down.
- * Re-attach the netdev and clear the suspend-time error so the data
- * path resumes. If the firmware did not actually survive, the data-
- * flow watchdog + recovery_work will detect the stall and rebuild --
- * that path is safe (runs from a workqueue, not here).
+ * S3 resume. Re-attach the netdev, restart the TX queue (which we stopped
+ * in xmm7360_suspend), and re-arm the watchdog timer.  If the firmware did
+ * not actually survive S3, the data-flow watchdog will detect the one-way
+ * stall and trigger recovery_work from a safe workqueue context.
  */
 static int xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
 
-	xmm->error = 0;
-	if (xmm->netdev)
+	WRITE_ONCE(xmm->error, 0);
+	if (xmm->netdev) {
 		netif_device_attach(xmm->netdev);
+		/*
+		 * xmm7360_suspend() called netif_stop_queue(); we must
+		 * restart it here or the TX queue stays permanently stopped
+		 * after every S3 resume (packets are silently dropped by the
+		 * stack because the queue reports "stopped").
+		 */
+		netif_start_queue(xmm->netdev);
+	}
+
+	/*
+	 * Re-arm the data-flow watchdog.  It was running before suspend;
+	 * without this the stall-detection timer never fires again after S3.
+	 */
+	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
+
+	/*
+	 * Emit the "resumed" uevent so the udev rule (80-xmm7360.rules)
+	 * re-runs xmm7360-init.service (RPC re-wake) and mmcli -S.  The
+	 * modem's RPC channel needs re-initialisation after every S3 resume
+	 * even though the hardware survives; without this, ModemManager sees
+	 * a live ttyXMM but cannot communicate with the modem.
+	 * The xmm7360-sleep post phase also restarts these services as a
+	 * belt-and-suspenders fallback.
+	 */
+	xmm7360_emit_uevent(xmm, "resumed");
 
 	dev_info(dev, "xmm7360: resumed (S3)\n");
 	return 0;
 }
 
 /*
- * Hibernation restore (S4): the system image was written to disk and the
- * machine fully power-cycled. The DMA coherent memory physical addresses
- * the restored image "remembers" are stale — reprogramming hardware with
- * them would panic. So we must NOT touch hardware here. Instead emit
- * "failed", which the udev rule routes to xmm7360-recovery.service for a
- * clean module reload (full teardown + fresh probe). This is the only
- * safe way to recover a fully power-cycled modem; doing it in-callback
- * would risk the lock-ordering hazards we keep out of the PM path.
- */
-#endif /* CONFIG_PM_SLEEP */
-
-/*
  * Only S3 (suspend-to-RAM / s2idle) goes through pm_ops; the device
  * stays powered there. Hibernation (S4) is handled entirely by
  * xmm7360_pm_notifier (unbind before image, re-probe after), so the
- * .freeze/.thaw/.restore/.poweroff callbacks are intentionally unset --
- * by the time they would run, the driver is already unbound.
+ * .freeze/.thaw/.restore/.poweroff callbacks are intentionally unset.
  */
 static const struct dev_pm_ops xmm7360_pm_ops = {
 	.suspend = xmm7360_suspend,
 	.resume  = xmm7360_resume,
 };
+#endif /* CONFIG_PM_SLEEP */
 
 static struct pci_driver xmm7360_driver = {
 	.name     = "xmm7360",
 	.id_table = xmm7360_ids,
 	.probe    = xmm7360_probe,
 	.remove   = xmm7360_remove,
-	.driver.pm = &xmm7360_pm_ops,
+	.driver.pm = pm_sleep_ptr(&xmm7360_pm_ops),
 };
 
 /*
@@ -2126,36 +2203,34 @@ static int xmm7360_pm_notify(struct notifier_block *nb, unsigned long mode,
 			     void *unused)
 {
 	switch (mode) {
-	case PM_SUSPEND_PREPARE:
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
 		/*
-		 * Unbind the driver before ANY sleep transition (S3 or S4).
-		 * pci_unregister_driver() runs the full .remove teardown
-		 * synchronously here -- the in-kernel equivalent of
-		 * "modprobe -r" -- so the device is left with no live DMA
-		 * rings, no armed IRQ, no stale state to corrupt across the
-		 * power cycle. The xmm7360-sleep hook has already dropped the
-		 * data connection in userspace before we get here, so this
-		 * teardown runs from the idle state (no pppd holding a port,
-		 * refcount at baseline) and cannot wedge.
+		 * Unbind the driver only before S4 (hibernation / restore).
+		 * S3 (suspend-to-RAM / s2idle) is handled exclusively by
+		 * xmm7360_suspend() / xmm7360_resume() via pm_ops -- the
+		 * device stays powered across S3 so there is no stale DMA
+		 * state to worry about.  Calling pci_unregister_driver() on
+		 * PM_SUSPEND_PREPARE (S3) tears down netdev/tty while
+		 * xmm7360_suspend() is still about to run against them,
+		 * causing a NULL-deref / use-after-free wedge.
 		 */
 		if (xmm7360_pci_registered) {
 			pci_unregister_driver(&xmm7360_driver);
 			xmm7360_pci_registered = false;
 		}
 		break;
-	case PM_POST_SUSPEND:
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
-		/* Re-bind on wake: re-probe from scratch (== "modprobe", the
-		 * cold-boot path, which is known to work). */
+		/* Re-bind after S4: re-probe from scratch (cold-boot path). */
 		if (!xmm7360_pci_registered) {
 			if (pci_register_driver(&xmm7360_driver) == 0)
 				xmm7360_pci_registered = true;
 			else
 				pr_err("xmm7360: failed to re-register after resume\n");
 		}
+		break;
+	default:
 		break;
 	}
 	return NOTIFY_DONE;
