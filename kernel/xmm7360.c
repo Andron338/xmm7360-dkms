@@ -2054,6 +2054,7 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct xmm_dev *xmm = kzalloc(sizeof(struct xmm_dev), GFP_KERNEL);
 	int ret;
+	u32 cap = 0;
 
 	/* Fix: check allocation before dereferencing */
 	if (!xmm) {
@@ -2077,6 +2078,19 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		dev_err(xmm->dev, "Cannot set DMA mask\n");
 		goto err_disable;
 	}
+
+	/*
+	 * Enable PCIe Latency Tolerance Reporting if the device advertises it.
+	 * Ported from Intel's in-tree iosm driver (ipc_pcie_resources_request):
+	 * LTR is required for the link to enter the L1.2 substate, which is the
+	 * low-power link state the modem uses while the host is in s2idle/S3.
+	 * Without LTR the device may fail to enter (or cleanly exit) L1.2 across
+	 * suspend, which shows up as a wedged modem after resume.
+	 */
+	pcie_capability_read_dword(dev, PCI_EXP_DEVCAP2, &cap);
+	if (cap & PCI_EXP_DEVCAP2_LTR)
+		pcie_capability_set_word(dev, PCI_EXP_DEVCTL2,
+					 PCI_EXP_DEVCTL2_LTR_EN);
 
 	ret = pci_request_region(dev, 0, "xmm0");
 	if (ret) {
@@ -2160,15 +2174,48 @@ err_free:
 	return ret;
 }
 
-#ifdef CONFIG_PM_SLEEP
+/*
+ * Power-management callbacks.  Following the in-tree iosm driver, these are
+ * marked __maybe_unused rather than wrapped in #ifdef CONFIG_PM_SLEEP: the
+ * pci_driver references them via pm_sleep_ptr() unconditionally, which nulls
+ * the ops out at the use-site when CONFIG_PM_SLEEP=n while still keeping the
+ * symbols defined so the build does not break.
+ *
+ * Is the PCIe data link to the modem actually up?
+ *
+ * Ported from Intel's in-tree iosm driver (ipc_pcie_check_data_link_active):
+ * read the Data Link Layer Link Active bit from the *upstream* port's link
+ * status register.  We use this on resume to tell apart "modem stayed powered
+ * across S3" from "platform cut power / D3cold" -- in the latter case the BARs
+ * read 0xffffffff and we must rebuild rather than push traffic into a dead
+ * device.  Returns false (conservatively) if the topology is unexpected.
+ */
+static bool __maybe_unused xmm7360_pcie_link_active(struct xmm_dev *xmm)
+{
+	struct pci_dev *parent;
+	u16 link_status = 0;
+
+	if (!xmm->pci_dev || !xmm->pci_dev->bus || !xmm->pci_dev->bus->self)
+		return false;
+
+	parent = xmm->pci_dev->bus->self;
+	pcie_capability_read_word(parent, PCI_EXP_LNKSTA, &link_status);
+
+	return !!(link_status & PCI_EXP_LNKSTA_DLLLA);
+}
+
 /*
  * S3 (suspend-to-RAM / s2idle) suspend/resume.
  *
- * The XMM7360 stays powered across S3: its firmware, DMA rings and BAR
- * state all survive.  We therefore do NOT tear down the rings or set the
- * error flag here.  We simply quiesce the data path (stop TX queue, detach
- * netdev, cancel timers/work) and let the hardware coast.  On resume we
- * re-attach and restart the queue.
+ * On most platforms the XMM7360 stays powered across S3 (its firmware, DMA
+ * rings and BAR state survive), so suspend just quiesces the data path (stop
+ * TX queue, detach netdev, mask the IRQ, cancel timers/work) and lets the
+ * hardware coast.  But some platforms drop the M.2 WWAN slot to D3cold during
+ * S3, in which case the firmware is gone on resume.  We therefore do NOT blindly
+ * restart traffic in xmm7360_resume(): like iosm, we first verify the device is
+ * actually back (PCIe link up + firmware "ready" status word) and only then
+ * re-attach.  If the modem did not survive, we hand off to the existing recovery
+ * machinery, which rebuilds from scratch exactly like a cold boot.
  *
  * S4 (hibernation) is handled exclusively by xmm7360_pm_notifier, which
  * unbinds the driver (pci_unregister_driver) before the image is written and
@@ -2179,7 +2226,7 @@ err_free:
  * PM_SUSPEND_PREPARE (S3) -- that would tear down netdev/tty before
  * xmm7360_suspend() runs, causing NULL-deref / use-after-free wedges.
  */
-static int xmm7360_suspend(struct device *dev)
+static int __maybe_unused xmm7360_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
@@ -2207,6 +2254,18 @@ static int xmm7360_suspend(struct device *dev)
 	cancel_work_sync(&xmm->recovery_work);
 	cancel_work_sync(&xmm->init_work);
 
+	/*
+	 * Mask the MSI now that recovery/init work has fully drained (so the
+	 * irq-disable depth is back at baseline).  This matches the discipline
+	 * in xmm7360_remove()/xmm7360_do_rebuild() and is the safe analog of
+	 * iosm gating its CP IRQ during sleep: it stops a stale or spurious MSI
+	 * from running xmm7360_irq0() against the device while the PCIe link is
+	 * mid-transition on the resume side.  Balanced 1:1 by enable_irq() in
+	 * xmm7360_resume() (the PM core always pairs resume with suspend).
+	 */
+	if (xmm->irq)
+		disable_irq(xmm->irq);
+
 	if (xmm->netdev) {
 		netif_stop_queue(xmm->netdev);
 		netif_device_detach(xmm->netdev);
@@ -2221,46 +2280,98 @@ static int xmm7360_suspend(struct device *dev)
 }
 
 /*
- * S3 resume. Re-attach the netdev, restart the TX queue (which we stopped
- * in xmm7360_suspend), and re-arm the watchdog timer.  If the firmware did
- * not actually survive S3, the data-flow watchdog will detect the one-way
- * stall and trigger recovery_work from a safe workqueue context.
+ * S3 resume.  Re-enable the IRQ, then decide whether the modem actually
+ * survived the sleep before touching the data path.
+ *
+ *  - If the PCIe link is up AND the firmware status word reads the "ready"
+ *    sentinel, the modem coasted through S3: re-attach the netdev, restart the
+ *    TX queue (stopped in suspend), re-arm the watchdog and nudge userspace.
+ *
+ *  - Otherwise the slot was powered down (D3cold) or the firmware reset.  The
+ *    old DMA rings now point at dead memory, so instead of restarting traffic
+ *    we mark the device errored and hand off to recovery_work, which tears
+ *    everything down and re-probes the firmware from scratch (the cold-boot
+ *    path -- the only thing known to recover a de-powered modem).  We must NOT
+ *    rebuild inline here: resume runs under the device PM lock, while rebuild
+ *    sleeps and re-takes rtnl/tty locks, so it has to run on the workqueue.
  */
-static int xmm7360_resume(struct device *dev)
+static int __maybe_unused xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
+	bool alive;
 
-	WRITE_ONCE(xmm->error, 0);
-	if (xmm->netdev) {
-		netif_device_attach(xmm->netdev);
+	/* Undo disable_irq() from xmm7360_suspend() (1:1 balanced). */
+	if (xmm->irq)
+		enable_irq(xmm->irq);
+
+	/*
+	 * Decide whether the modem really came back.
+	 *
+	 * The authoritative signal is the firmware status word -- the same
+	 * 0x600df00d sentinel xmm7360_poll() already trusts from the IRQ path.
+	 * We additionally consult the upstream PCIe port: if it is present and
+	 * reports the data link *down*, the modem is definitely gone, so we skip
+	 * the BAR read entirely (reading across a dead link is pointless and on
+	 * some platforms noisy).  If there is no upstream port to consult we just
+	 * fall back to the status word, which reads 0xffffffff on a dead device.
+	 */
+	if (xmm->pci_dev && xmm->pci_dev->bus && xmm->pci_dev->bus->self &&
+	    !xmm7360_pcie_link_active(xmm))
+		alive = false;
+	else
+		alive = xmm->bar2 && xmm->bar2[BAR2_STATUS] == 0x600df00d;
+
+	if (alive) {
+		WRITE_ONCE(xmm->error, 0);
+		if (xmm->netdev) {
+			netif_device_attach(xmm->netdev);
+			/*
+			 * xmm7360_suspend() called netif_stop_queue(); we must
+			 * restart it here or the TX queue stays permanently
+			 * stopped after every S3 resume (packets are silently
+			 * dropped by the stack because the queue reports
+			 * "stopped").
+			 */
+			netif_start_queue(xmm->netdev);
+		}
+
 		/*
-		 * xmm7360_suspend() called netif_stop_queue(); we must
-		 * restart it here or the TX queue stays permanently stopped
-		 * after every S3 resume (packets are silently dropped by the
-		 * stack because the queue reports "stopped").
+		 * Re-arm the data-flow watchdog.  It was running before suspend;
+		 * without this the stall-detection timer never fires again.
 		 */
-		netif_start_queue(xmm->netdev);
+		mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
+
+		/*
+		 * Emit the "resumed" uevent so the udev rule (80-xmm7360.rules)
+		 * re-runs xmm7360-init.service (RPC re-wake) and mmcli -S.  The
+		 * modem's RPC channel needs re-initialisation after every S3
+		 * resume even though the hardware survives; without this,
+		 * ModemManager sees a live ttyXMM but cannot communicate with
+		 * the modem.  The xmm7360-sleep post phase also restarts these
+		 * services as a belt-and-suspenders fallback.
+		 */
+		xmm7360_emit_uevent(xmm, "resumed");
+
+		dev_info(dev, "xmm7360: resumed (S3), modem alive\n");
+		return 0;
 	}
 
 	/*
-	 * Re-arm the data-flow watchdog.  It was running before suspend;
-	 * without this the stall-detection timer never fires again after S3.
+	 * Modem did not survive the sleep.  Leave the netdev detached and the
+	 * queue stopped (recovery_work recreates them) and schedule a full
+	 * rebuild.  Reset the recovery throttle the same way probe does: a
+	 * resume is a legitimate fresh event, not a runaway recovery loop, so
+	 * it should always be allowed to rebuild.
 	 */
-	mod_timer(&xmm->watchdog, jiffies + XMM_WATCHDOG_INTERVAL);
+	dev_warn(dev,
+		 "xmm7360: modem did not survive S3 (link/status down) -- scheduling rebuild\n");
+	xmm7360_set_error(xmm, -ENODEV);
+	xmm->recovery_count = 0;
+	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
+	schedule_work(&xmm->recovery_work);
 
-	/*
-	 * Emit the "resumed" uevent so the udev rule (80-xmm7360.rules)
-	 * re-runs xmm7360-init.service (RPC re-wake) and mmcli -S.  The
-	 * modem's RPC channel needs re-initialisation after every S3 resume
-	 * even though the hardware survives; without this, ModemManager sees
-	 * a live ttyXMM but cannot communicate with the modem.
-	 * The xmm7360-sleep post phase also restarts these services as a
-	 * belt-and-suspenders fallback.
-	 */
-	xmm7360_emit_uevent(xmm, "resumed");
-
-	dev_info(dev, "xmm7360: resumed (S3)\n");
+	dev_info(dev, "xmm7360: resumed (S3), recovery scheduled\n");
 	return 0;
 }
 
@@ -2274,7 +2385,6 @@ static const struct dev_pm_ops xmm7360_pm_ops = {
 	.suspend = xmm7360_suspend,
 	.resume  = xmm7360_resume,
 };
-#endif /* CONFIG_PM_SLEEP */
 
 static struct pci_driver xmm7360_driver = {
 	.name     = "xmm7360",

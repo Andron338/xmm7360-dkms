@@ -10,7 +10,7 @@ See [DEVICES.md](DEVICES.md) for the full list of tested devices.
 > ⚠️ _In development. No support provided. May not work, may crash your
 > computer, may singe your jaffles._
 
-![CI](https://github.com/xmm7360/xmm7360-pci/workflows/CI/badge.svg)
+![CI](https://github.com/Andron338/xmm7360-dkms/actions/workflows/tests.yaml/badge.svg)
 
 ---
 
@@ -36,8 +36,8 @@ IP connection.
 
 ```bash
 # Clone the repo
-git clone https://github.com/Andron338/xmm7360-pci.git
-cd xmm7360-pci
+git clone https://github.com/Andron338/xmm7360-dkms.git
+cd xmm7360-dkms
 
 # Build and install via pacman (handles DKMS, udev, systemd)
 makepkg -si
@@ -82,22 +82,48 @@ make -C tool
 ### Install
 
 ```bash
-# Install kernel module via DKMS
-sudo cp xmm7360.c /usr/src/xmm7360-1.0.0/
-sudo cp Makefile.dkms /usr/src/xmm7360-1.0.0/Makefile
-sudo cp dkms.conf /usr/src/xmm7360-1.0.0/
-sudo dkms install xmm7360/1.0.0
+# Pick any version string; it just has to match what you pass to dkms.
+VER=1.0.0
 
-# Install RPC tool
-sudo install -m755 rpc/open_xdatachannel /usr/local/bin/
+# Install the kernel module source via DKMS. dkms.conf ships with a
+# @VERSION@ placeholder that must be substituted (the Arch package does
+# this automatically; do it by hand here).
+sudo mkdir -p "/usr/src/xmm7360-$VER"
+sudo cp kernel/xmm7360.c     "/usr/src/xmm7360-$VER/"
+sudo cp kernel/Makefile.dkms "/usr/src/xmm7360-$VER/Makefile"
+sudo sed "s/@VERSION@/$VER/" kernel/dkms.conf \
+    | sudo tee "/usr/src/xmm7360-$VER/dkms.conf" >/dev/null
+sudo dkms install "xmm7360/$VER"
 
-# Install udev rule and systemd service
-sudo cp 80-xmm7360.rules /usr/lib/udev/rules.d/
-sudo cp xmm7360-init.service /usr/lib/systemd/system/
-sudo cp xmm7360-modprobe.conf /usr/lib/modprobe.d/xmm7360.conf
+# Install the RPC tool. NOTE: xmm7360-init.service runs
+# /usr/bin/open_xdatachannel, so install it there (not /usr/local/bin).
+sudo install -Dm755 tool/open_xdatachannel /usr/bin/open_xdatachannel
+sudo install -Dm755 scripts/xmm7360-reset  /usr/bin/xmm7360-reset
 
-# Enable init service
-sudo systemctl enable xmm7360-init.service
+# udev rule + iosm blacklist
+sudo cp udev/80-xmm7360.rules      /usr/lib/udev/rules.d/
+sudo cp conf/xmm7360-modprobe.conf /usr/lib/modprobe.d/xmm7360.conf
+
+# systemd units: boot init, signal polling, presence watchdog, and the
+# udev-triggered last-resort module reload.
+sudo cp systemd/xmm7360-init.service     /usr/lib/systemd/system/
+sudo cp systemd/xmm7360-signal.service   /usr/lib/systemd/system/
+sudo cp systemd/xmm7360-rescan.service   /usr/lib/systemd/system/
+sudo cp systemd/xmm7360-recovery.service /usr/lib/systemd/system/
+
+# Suspend/hibernate hook — releases the modem's device nodes before the
+# kernel unbinds the driver. Required for safe hibernation (see below).
+sudo install -Dm755 scripts/xmm7360-sleep /usr/lib/systemd/system-sleep/xmm7360
+
+# Default config (set your carrier's APN)
+echo 'XMM_APN=internet' | sudo tee /etc/xmm7360.conf >/dev/null
+
+# Activate. Do NOT 'enable' xmm7360-recovery.service: it has no [Install]
+# section and is started on demand by udev.
+sudo udevadm control --reload-rules
+sudo systemctl daemon-reload
+sudo systemctl enable xmm7360-init.service xmm7360-signal.service
+sudo systemctl enable --now xmm7360-rescan.service
 
 # Reboot
 sudo reboot
@@ -173,22 +199,44 @@ sudo systemctl restart ModemManager
 ## Uninstall
 
 ```bash
-sudo pacman -R xmm7360-dkms   # Arch
-# or
-sudo dkms remove xmm7360/1.0.0 --all
-sudo rm /usr/local/bin/open_xdatachannel
-sudo rm /usr/lib/udev/rules.d/80-xmm7360.rules
-sudo rm /usr/lib/systemd/system/xmm7360-init.service
-sudo rm /usr/lib/modprobe.d/xmm7360.conf
+sudo pacman -R xmm7360-dkms-git    # Arch (this is the package name)
+```
+
+Or, to undo a manual install (use the same `$VER` you installed with):
+
+```bash
+sudo dkms remove "xmm7360/$VER" --all
+sudo rm -f /usr/bin/open_xdatachannel /usr/bin/xmm7360-reset
+sudo rm -f /usr/lib/systemd/system-sleep/xmm7360
+sudo rm -f /usr/lib/udev/rules.d/80-xmm7360.rules
+sudo rm -f /usr/lib/modprobe.d/xmm7360.conf
+sudo rm -f /usr/lib/systemd/system/xmm7360-{init,signal,rescan,recovery}.service
+sudo systemctl daemon-reload
+sudo udevadm control --reload-rules
 ```
 
 ---
 
 ## Power management
 
-Suspend/resume is handled in-kernel. On resume the module emits a uevent
-that re-runs `xmm7360-init.service` automatically, so the modem returns
-without any manual step or systemd sleep hook.
+Suspend/resume and hibernation are handled in the kernel module, with a small
+userspace hook for safety:
+
+- **Suspend (S3 / s2idle):** the driver's `.suspend`/`.resume` callbacks quiesce
+  the data path on the way down. On resume it checks the PCIe link and the
+  firmware status word: if the modem survived it re-attaches `wwan0`; if the
+  platform cut power to the slot it triggers an in-kernel rebuild from scratch.
+- **Hibernation (S4):** the driver unbinds itself before the hibernation image
+  is written and re-probes cleanly afterwards, so no stale DMA/ring state is
+  ever restored.
+- **`xmm7360-sleep`** (installed to `/usr/lib/systemd/system-sleep/`) runs
+  *before* the kernel unbinds the driver and releases the modem's device nodes
+  (stops ModemManager, drops the connection, kills `pppd`/`open_xdatachannel`).
+  This is required so that close() can't race the unbind during hibernation. It
+  also restarts those services on resume.
+- On resume/recovery the module emits a `udev` uevent (`XMM7360_STATE=resumed`
+  / `recovered`) that re-runs `xmm7360-init.service`, re-scans ModemManager and
+  restarts signal polling — so the modem comes back without manual steps.
 
 If ModemManager ever drops the modem after a disconnect, the
 `xmm7360-rescan.service` re-scans it automatically; `sudo xmm7360-reset`
@@ -199,7 +247,7 @@ forces a full module reload as a last resort.
 ## Project layout
 
 ```
-xmm7360-pci/
+xmm7360-dkms/
 ├── PKGBUILD / .SRCINFO / xmm7360-dkms.install   Arch packaging (flat for AUR)
 ├── kernel/    xmm7360.c, Makefile, Makefile.dkms, dkms.conf
 ├── tool/      open_xdatachannel.c, xmm_*.{c,h}, Makefile, man page
@@ -207,7 +255,7 @@ xmm7360-pci/
 ├── systemd/   init / signal / rescan / recovery services
 ├── udev/      80-xmm7360.rules
 ├── conf/      xmm7360-modprobe.conf (blacklists iosm)
-├── scripts/   xmm7360-reset (manual recovery)
+├── scripts/   xmm7360-reset (manual recovery), xmm7360-sleep (system-sleep hook)
 ├── docs/      INSTALLING.md, DEVICES.md
 └── .github/workflows/   CI/CD (see below)
 ```
@@ -221,10 +269,6 @@ xmm7360-pci/
 | `kernel-module-ci.yaml` | build `.ko` against 5 kernels |
 | `makepkg.yaml` | build + lint package, DKMS-build per kernel |
 | `aur-publish.yaml` | auto-publish to the AUR on packaging changes |
-| `80-xmm7360.rules` | udev rules |
-| `xmm7360-modprobe.conf` | Blacklists iosm |
-| `xmm7360-dkms.install` | Arch post-install hooks |
-| `rpc/` | Userspace RPC tool source |
 
 ---
 
