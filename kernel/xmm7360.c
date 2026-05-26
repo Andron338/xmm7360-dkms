@@ -680,8 +680,8 @@ static int xmm7360_qp_can_write(struct queue_pair *qp)
 	return !xmm7360_td_ring_full(xmm, qp->num * 2);
 }
 
-static size_t xmm7360_qp_write(struct queue_pair *qp, const char *buf,
-			       size_t size)
+static ssize_t xmm7360_qp_write(struct queue_pair *qp, const char *buf,
+				size_t size)
 {
 	struct xmm_dev *xmm = qp->xmm;
 	int page_size = qp->xmm->td_ring[qp->num * 2].page_size;
@@ -697,8 +697,8 @@ static size_t xmm7360_qp_write(struct queue_pair *qp, const char *buf,
 	return size;
 }
 
-static size_t xmm7360_qp_write_user(struct queue_pair *qp,
-				    const char __user *buf, size_t size)
+static ssize_t xmm7360_qp_write_user(struct queue_pair *qp,
+				     const char __user *buf, size_t size)
 {
 	int page_size = qp->xmm->td_ring[qp->num * 2].page_size;
 	int ret;
@@ -717,6 +717,15 @@ static int xmm7360_qp_has_data(struct queue_pair *qp)
 {
 	struct xmm_dev *xmm = qp->xmm;
 	struct td_ring *ring = &xmm->td_ring[qp->num * 2 + 1];
+	/*
+	 * cp is NULL between cmd_ring_free() and cmd_ring_init() during
+	 * recovery, and after remove(). This function is evaluated from the
+	 * cdev_read()/cdev_poll() wait predicates, which can be re-checked
+	 * (via wake_up in xmm7360_set_error()) at exactly that moment -- so
+	 * guard before dereferencing or we take a NULL deref oops.
+	 */
+	if (!READ_ONCE(xmm->cp))
+		return 0;
 	return xmm->cp->s_rptr[qp->num * 2 + 1] != ring->last_handled;
 }
 
@@ -758,7 +767,7 @@ ssize_t xmm7360_cdev_write(struct file *file, const char __user *buf,
 			   size_t size, loff_t *offset)
 {
 	struct queue_pair *qp = file->private_data;
-	int ret;
+	ssize_t ret;
 
 	ret = xmm7360_qp_write_user(qp, buf, size);
 	if (ret < 0)
@@ -776,8 +785,9 @@ ssize_t xmm7360_cdev_read(struct file *file, char __user *buf, size_t size,
 	struct xmm_dev *xmm = qp->xmm;
 	struct td_ring *ring = &xmm->td_ring[qp->num * 2 + 1];
 	int idx, nread, ret;
+	/* error first: short-circuits qp_has_data() during recovery/remove */
 	ret = wait_event_interruptible(qp->wq,
-				       xmm7360_qp_has_data(qp) || READ_ONCE(xmm->error));
+				       READ_ONCE(xmm->error) || xmm7360_qp_has_data(qp));
 	if (ret < 0)
 		return ret;
 	if (READ_ONCE(xmm->error))
@@ -1059,9 +1069,9 @@ drop:
 	dev_err(xn->xmm->dev, "Failed to ship coalesced frame");
 	/* Fix: free queued SKBs to prevent memory leak */
 	{
-		struct sk_buff *skb;
-		while ((skb = skb_dequeue(&xn->queue)))
-			kfree_skb(skb);
+		struct sk_buff *drop_skb;
+		while ((drop_skb = skb_dequeue(&xn->queue)))
+			kfree_skb(drop_skb);
 	}
 	xn->queued_packets = xn->queued_bytes = 0;
 }
@@ -1992,34 +2002,34 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	ret = pci_enable_device(dev);
 	if (ret) {
 		dev_err(&(dev->dev), "pci_enable_device\n");
-		goto fail;
+		goto err_free;
 	}
 	pci_set_master(dev);
 
 	ret = dma_set_mask_and_coherent(xmm->dev, DMA_BIT_MASK(64));
 	if (ret) {
 		dev_err(xmm->dev, "Cannot set DMA mask\n");
-		goto fail;
+		goto err_disable;
 	}
 
 	ret = pci_request_region(dev, 0, "xmm0");
 	if (ret) {
 		dev_err(&(dev->dev), "pci_request_region(0)\n");
-		goto fail;
+		goto err_disable;
 	}
 	xmm->bar0 = pci_iomap(dev, 0, pci_resource_len(dev, 0));
 
 	ret = pci_request_region(dev, 2, "xmm2");
 	if (ret) {
 		dev_err(&(dev->dev), "pci_request_region(2)\n");
-		goto fail;
+		goto err_region0;
 	}
 	xmm->bar2 = pci_iomap(dev, 2, pci_resource_len(dev, 2));
 
 	ret = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_MSIX);
 	if (ret < 0) {
 		dev_err(&(dev->dev), "pci_alloc_irq_vectors\n");
-		goto fail;
+		goto err_region2;
 	}
 
 	init_waitqueue_head(&xmm->wq);
@@ -2033,28 +2043,54 @@ static int xmm7360_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	ret = request_irq(xmm->irq, xmm7360_irq0, 0, "xmm7360", xmm);
 	if (ret) {
 		dev_err(&(dev->dev), "request_irq\n");
-		xmm->irq = 0;  /* mark as not requested so fail path skips disable_irq */
-		goto fail;
+		xmm->irq = 0;  /* not requested -> err_timer must not free_irq */
+		goto err_timer;
 	}
 
 	pci_set_drvdata(dev, xmm);
 
 	ret = xmm7360_dev_init(xmm);
-	if (!ret)
-		return 0;
+	if (ret)
+		goto err_irq;
 
-fail:
+	return 0;
+
 	/*
-	 * Disable the IRQ before dev_deinit for the same reason as in
-	 * xmm7360_remove: dev_deinit nulls xmm->cp and xmm->net, and the
-	 * IRQ handler dereferences both. xmm7360_remove() will call
-	 * free_irq() to finish the teardown, but we must mask the line here
-	 * first so no handler fires in the window between deinit and remove.
+	 * Staged error unwind: each label undoes exactly the resource acquired
+	 * just above it, in reverse order, and falls through to the ones below.
+	 *
+	 * NOTE: xmm7360_dev_init() already calls xmm7360_dev_deinit() on its own
+	 * internal failure, so the device is fully deinited by the time we reach
+	 * err_irq -- we must NOT call dev_deinit again here (the old code called
+	 * it a second time and then a third via xmm7360_remove(), and also
+	 * released BAR regions that may never have been requested on the early
+	 * goto paths). err_irq therefore only tears down IRQ and below.
 	 */
-	if (xmm->irq)
-		disable_irq(xmm->irq);
-	xmm7360_dev_deinit(xmm);
-	xmm7360_remove(dev);
+err_irq:
+	disable_irq(xmm->irq);
+	free_irq(xmm->irq, xmm);
+err_timer:
+	/* watchdog was armed before request_irq; cancel it (and any recovery
+	 * work it may have queued) before freeing xmm, or the timer/worker
+	 * fires against freed memory. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
+	timer_delete_sync(&xmm->watchdog);
+#else
+	del_timer_sync(&xmm->watchdog);
+#endif
+	cancel_work_sync(&xmm->recovery_work);
+	cancel_work_sync(&xmm->init_work);
+	pci_free_irq_vectors(dev);
+err_region2:
+	pci_release_region(dev, 2);
+err_region0:
+	pci_release_region(dev, 0);
+err_disable:
+	pci_disable_device(dev);
+err_free:
+	/* Only the driver's reference exists here (no cdev/tty was registered,
+	 * or dev_init already dropped those), so this frees xmm. */
+	kref_put(&xmm->kref, xmm7360_free);
 	return ret;
 }
 

@@ -11,10 +11,21 @@ Type=oneshot
 RemainAfterExit=yes
 
 # Wait for MM to actually have the modem, then enable signal polling.
-# MM is on the bus now (we run After it), so mmcli works here.
+# Resolve the modem index dynamically: on a multi-modem system (or after a
+# recovery re-enumeration) the XMM7360 is not necessarily index 0, so match
+# it by its ttyXMM ports / Fibocom identity rather than hardcoding -m 0.
 ExecStart=/bin/sh -c '\
     for i in $(seq 1 30); do \
-        mmcli -m 0 --signal-setup=5 2>/dev/null && exit 0; \
+        idx=""; \
+        for p in $(mmcli -L 2>/dev/null | grep -oE "/Modem/[0-9]+"); do \
+            n=${p##*/}; \
+            if mmcli -m "$n" 2>/dev/null | grep -qiE "ttyXMM|XMM7360|Fibocom|L850"; then \
+                idx="$n"; break; \
+            fi; \
+        done; \
+        if [ -n "$idx" ] && mmcli -m "$idx" --signal-setup=5 2>/dev/null; then \
+            exit 0; \
+        fi; \
         sleep 1; \
     done; \
     exit 0'
