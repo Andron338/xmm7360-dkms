@@ -418,6 +418,10 @@ static int xmm7360_cmd_ring_init(struct xmm_dev *xmm)
 
 	xmm->cp = dma_alloc_coherent(xmm->dev, sizeof(struct control_page),
 				     &xmm->cp_phys, GFP_KERNEL);
+	if (!xmm->cp) {
+		dev_err(xmm->dev, "cmd ring: dma_alloc_coherent failed\n");
+		return -ENOMEM;
+	}
 
 	xmm->cp->ctl.status =
 		xmm->cp_phys + offsetof(struct control_page, status);
@@ -495,14 +499,26 @@ static int xmm7360_td_ring_create(struct xmm_dev *xmm, u8 ring_id, u8 depth,
 	ring->tds = dma_alloc_coherent(xmm->dev,
 				       sizeof(struct td_ring_entry) * depth,
 				       &ring->tds_phys, GFP_KERNEL);
+	if (!ring->tds) {
+		ret = -ENOMEM;
+		goto err_reset;
+	}
 
-	ring->pages = kzalloc(sizeof(void *) * depth, GFP_KERNEL);
-	ring->pages_phys = kzalloc(sizeof(dma_addr_t) * depth, GFP_KERNEL);
+	ring->pages = kcalloc(depth, sizeof(void *), GFP_KERNEL);
+	ring->pages_phys = kcalloc(depth, sizeof(dma_addr_t), GFP_KERNEL);
+	if (!ring->pages || !ring->pages_phys) {
+		ret = -ENOMEM;
+		goto err_free_arrays;
+	}
 
 	for (i = 0; i < depth; i++) {
 		ring->pages[i] = dma_alloc_coherent(xmm->dev, ring->page_size,
 						    &ring->pages_phys[i],
 						    GFP_KERNEL);
+		if (!ring->pages[i]) {
+			ret = -ENOMEM;
+			goto err_free_pages;
+		}
 		ring->tds[i].addr = ring->pages_phys[i];
 	}
 
@@ -510,8 +526,28 @@ static int xmm7360_td_ring_create(struct xmm_dev *xmm, u8 ring_id, u8 depth,
 	ret = xmm7360_cmd_ring_execute(xmm, CMD_RING_OPEN, ring_id, depth,
 				       ring->tds_phys, 0x60);
 	if (ret)
-		return ret;
+		goto err_free_pages;
 	return 0;
+
+	/*
+	 * Unwind on failure so the queue pair is left with depth == 0 and no
+	 * leaked DMA buffers. Previously these allocations were never checked
+	 * (NULL deref / oops under memory pressure) and a CMD_RING_OPEN error
+	 * leaked the whole ring.
+	 */
+err_free_pages:
+	for (i = 0; i < depth; i++)
+		if (ring->pages[i])
+			dma_free_coherent(xmm->dev, ring->page_size,
+					  ring->pages[i], ring->pages_phys[i]);
+err_free_arrays:
+	kfree(ring->pages_phys);
+	kfree(ring->pages);
+	dma_free_coherent(xmm->dev, sizeof(struct td_ring_entry) * depth,
+			  ring->tds, ring->tds_phys);
+err_reset:
+	ring->depth = 0;
+	return ret;
 }
 
 static void xmm7360_td_ring_destroy(struct xmm_dev *xmm, u8 ring_id)
@@ -636,12 +672,18 @@ static int xmm7360_qp_start(struct queue_pair *qp)
 
 		ret = xmm7360_td_ring_create(xmm, qp->num * 2, qp->depth,
 					     qp->page_size);
-		if (ret)
+		if (ret) {
+			/* Roll back the open flag, or the queue pair is stuck
+			 * "open" forever: open() returned an error so release()
+			 * never runs, and every future open() gets -EBUSY. */
+			WRITE_ONCE(qp->open, 0);
 			goto out;
+		}
 		ret = xmm7360_td_ring_create(xmm, qp->num * 2 + 1, qp->depth,
 					     qp->page_size);
 		if (ret) {
 			xmm7360_td_ring_destroy(xmm, qp->num * 2);
+			WRITE_ONCE(qp->open, 0);
 			goto out;
 		}
 		while (!xmm7360_td_ring_full(xmm, qp->num * 2 + 1))
@@ -1043,7 +1085,16 @@ static void xmm7360_net_flush(struct xmm_net *xn)
 	xmm7360_mux_frame_add_tag(frame, 'ADBH', 0, NULL, 0);
 
 	while ((skb = skb_dequeue(&xn->queue))) {
+		/*
+		 * append_packet copies skb->data into the mux frame, so the
+		 * skb is no longer needed once appended -- free it here on
+		 * BOTH the success and failure paths. (A previous version
+		 * dropped this free and only reclaimed skbs still left in the
+		 * queue at the drop label, leaking one sk_buff for every
+		 * transmitted packet.)
+		 */
 		ret = xmm7360_mux_frame_append_packet(frame, skb);
+		kfree_skb(skb);
 		if (ret)
 			goto drop;
 	}
@@ -1067,7 +1118,8 @@ static void xmm7360_net_flush(struct xmm_net *xn)
 
 drop:
 	dev_err(xn->xmm->dev, "Failed to ship coalesced frame");
-	/* Fix: free queued SKBs to prevent memory leak */
+	/* The in-flight skb was already freed in the loop above; here we
+	 * only reclaim packets still sitting in the queue. */
 	{
 		struct sk_buff *drop_skb;
 		while ((drop_skb = skb_dequeue(&xn->queue)))
@@ -1316,17 +1368,31 @@ static int xmm7360_create_net(struct xmm_dev *xmm)
 	rtnl_lock();
 	ret = register_netdevice(netdev);
 	rtnl_unlock();
+	if (ret < 0)
+		goto err_free;
 
 	xn->qp = xmm7360_init_qp(xmm, 0, 128, TD_MAX_PAGE_SIZE);
-	if (!ret)
-		ret = xmm7360_qp_start(xn->qp);
+	ret = xmm7360_qp_start(xn->qp);
+	if (ret < 0)
+		goto err_unreg;
 
-	if (ret < 0) {
-		free_netdev(netdev);
-		xmm7360_qp_stop(xn->qp);
-		xmm->netdev = NULL;
-	}
+	return 0;
 
+	/*
+	 * Error unwind. xn is netdev_priv(netdev), so it MUST NOT be touched
+	 * after free_netdev(). qp_start() fully tears down its own rings on
+	 * failure, so there is nothing to stop here. (The old code called
+	 * free_netdev() first and then dereferenced xn->qp -- a use-after-free
+	 * -- and left xmm->net dangling at the freed netdev_priv.)
+	 */
+err_unreg:
+	rtnl_lock();
+	unregister_netdevice(netdev);
+	rtnl_unlock();
+err_free:
+	free_netdev(netdev);
+	xmm->net    = NULL;
+	xmm->netdev = NULL;
 	return ret;
 }
 

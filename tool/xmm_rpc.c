@@ -444,7 +444,7 @@ int xmm_fcc_unlock(xmm_rpc_t *rpc) {
     if (rc < 0) return -1;
 
     xmm_reader_init(&r, resp.body, resp.body_len);
-    uint32_t result;
+    uint32_t result = 0;
     rc = unpack_u32(&r, &result);
     xmm_msg_free(&resp);
     if (rc < 0 || result != 1) {

@@ -52,6 +52,12 @@ int pack_u32(xmm_buf_t *b, uint32_t val) {
 }
 
 int pack_str(xmm_buf_t *b, const uint8_t *data, size_t valid_len, size_t max_len) {
+    /* valid_len must never exceed max_len: the padding count below is
+     * (max_len - valid_len) computed in size_t, so an inverted call would
+     * wrap to a huge value and spin the zero-fill loop until OOM. */
+    if (valid_len > max_len)
+        return -1;
+
     /* type tag */
     xmm_buf_append_byte(b, 0x55);
 
