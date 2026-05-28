@@ -573,16 +573,28 @@ static void xmm7360_td_ring_destroy(struct xmm_dev *xmm, u8 ring_id)
 		xmm7360_cmd_ring_execute(xmm, CMD_RING_CLOSE, ring_id, 0, 0, 0);
 
 	for (i = 0; i < depth; i++) {
-		dma_free_coherent(xmm->dev, ring->page_size, ring->pages[i],
-				  ring->pages_phys[i]);
+		if (ring->pages && ring->pages[i])
+			dma_free_coherent(xmm->dev, ring->page_size,
+					  ring->pages[i], ring->pages_phys[i]);
 	}
 
 	kfree(ring->pages_phys);
 	kfree(ring->pages);
 
-	dma_free_coherent(xmm->dev, sizeof(struct td_ring_entry) * depth,
-			  ring->tds, ring->tds_phys);
+	if (ring->tds)
+		dma_free_coherent(xmm->dev,
+				  sizeof(struct td_ring_entry) * depth,
+				  ring->tds, ring->tds_phys);
 
+	/*
+	 * Null everything and clear depth LAST so any second entry into this
+	 * function (racing close() vs rebuild) sees depth == 0 / NULL pointers
+	 * and cannot double-free.  This was the root cause of the
+	 * free_large_kmalloc("Not a kmalloc allocation") oops on resume-rebuild.
+	 */
+	ring->pages = NULL;
+	ring->pages_phys = NULL;
+	ring->tds = NULL;
 	ring->depth = 0;
 }
 
@@ -1507,6 +1519,22 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 		qp->registered = false;
 		WRITE_ONCE(qp->open, 0);
 	}
+
+	/*
+	 * Destroy any TD rings still allocated.  These are normally torn down
+	 * by xmm7360_qp_stop() on userspace close(), but on a dead-modem resume
+	 * dev_deinit() runs while fds may still be open (or the close path was
+	 * skipped because xmm->error was set), leaving rings with depth != 0 and
+	 * live pages/pages_phys/tds pointers.  If we do not free them here, the
+	 * subsequent dev_init()->td_ring_create() either trips BUG_ON(ring->depth)
+	 * or races a late qp_stop() into a double-free (free_large_kmalloc oops).
+	 * td_ring_destroy() now nulls + zeroes depth, so this is idempotent.
+	 */
+	for (i = 0; i < 16; i++) {
+		if (xmm->td_ring[i].depth)
+			xmm7360_td_ring_destroy(xmm, i);
+	}
+
 	xmm7360_cmd_ring_free(xmm);
 }
 
