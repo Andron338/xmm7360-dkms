@@ -1833,6 +1833,8 @@ static int xmm7360_create_cdev(struct xmm_dev *xmm, int num, const char *name,
 	return 0;
 }
 
+static bool __maybe_unused xmm7360_pcie_link_active(struct xmm_dev *xmm);
+
 static int xmm7360_dev_init(struct xmm_dev *xmm)
 {
 	int ret, i;
@@ -1840,6 +1842,30 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 
 	WRITE_ONCE(xmm->error, 0);
 	xmm->num_ttys = 0;
+
+	/*
+	 * Before the FIRST MMIO access, make sure the device is actually
+	 * reachable.  On resume/rebuild the M.2 slot may still be in D3cold or
+	 * the PCIe link may not have retrained.  A BAR read to a non-responding
+	 * endpoint does NOT fault -- it stalls the CPU until the bus times out
+	 * (and on some chipsets never returns), which is the hard wedge seen on
+	 * S3 resume.  A BAR read to a non-responding
+	 * endpoint does NOT fault -- it stalls the CPU until the bus times out
+	 * (and on some chipsets never returns), which is the hard wedge seen on
+	 * S3 resume.  Put the device back in D0, then consult the upstream port's
+	 * link-active bit via config space (handled by the root complex, so it
+	 * cannot hang like a BAR read).  If the link is down, bail cleanly
+	 * instead of touching bar2[0].
+	 */
+	if (xmm->pci_dev) {
+		pci_set_power_state(xmm->pci_dev, PCI_D0);
+		if (xmm->pci_dev->bus && xmm->pci_dev->bus->self &&
+		    !xmm7360_pcie_link_active(xmm)) {
+			dev_warn(xmm->dev,
+				 "PCIe link down at dev_init -- modem not reachable, aborting\n");
+			return -ENODEV;
+		}
+	}
 
 	status = xmm->bar2[0];
 	if (status == 0xfeedb007) {
@@ -2308,48 +2334,22 @@ static int __maybe_unused xmm7360_suspend(struct device *dev)
 }
 
 /*
- * Forward declarations for the S3 dead-modem reprobe path.  The driver
- * struct and registration flag are defined below, but xmm7360_resume()
- * (above them) needs to schedule a full unbind+reprobe.
- */
-static struct pci_driver xmm7360_driver;
-static bool xmm7360_pci_registered;
-
-/*
- * S3 dead-modem reprobe worker.
+ * S3 resume.  Re-enable the IRQ, then decide whether the modem actually
+ * survived the sleep before touching the data path.
  *
- * On this class of platform the M.2 WWAN slot is dropped to D3cold across
- * S3 (the whole downstream bus is reset -- see the "xHC error in resume /
- * root hub lost power" companions in the log), so the modem firmware is
- * gone on every S3 resume, exactly like an S4 cold start.  In-place rebuild
- * (dev_deinit/dev_init reusing the same embedded struct device) is unsafe
- * against that: it re-initialises live kobjects and races teardown, which
- * is what wedged/panicked S3 resume.
+ *  - If the PCIe link is up AND the firmware status word reads the "ready"
+ *    sentinel, the modem coasted through S3: re-attach the netdev, restart the
+ *    TX queue (stopped in suspend), re-arm the watchdog and nudge userspace.
  *
- * Instead we do the SAME thing the (working) S4 path does: a full
- * pci_unregister_driver() + pci_register_driver(), i.e. run .remove and then
- * a fresh .probe.  This MUST use a file-scope work item, never one embedded
- * in struct xmm_dev: pci_unregister_driver() -> xmm7360_remove() ->
- * kref_put() frees xmm, so a work_struct living inside xmm would be freed
- * out from under this very function (use-after-free).  This work item holds
- * no pointer into xmm and only touches the global driver.
+ *  - Otherwise the slot was powered down (D3cold) or the firmware reset.  The
+ *    old DMA rings now point at dead memory, so instead of restarting traffic
+ *    we mark the device errored and hand off to recovery_work, which tears
+ *    everything down and re-probes the firmware from scratch.  recovery_work
+ *    runs on the workqueue (not here under the PM lock), and dev_init() now
+ *    refuses to touch MMIO until the PCIe link is back (see the guard there),
+ *    so a still-D3cold slot makes recovery fail cleanly instead of wedging.
  */
-static void xmm7360_reprobe_fn(struct work_struct *w)
-{
-	if (xmm7360_pci_registered) {
-		/* runs xmm7360_remove() -> full teardown -> frees xmm */
-		pci_unregister_driver(&xmm7360_driver);
-		xmm7360_pci_registered = false;
-	}
-	/* fresh cold-boot-equivalent probe of the (now repowered) modem */
-	if (pci_register_driver(&xmm7360_driver) == 0)
-		xmm7360_pci_registered = true;
-	else
-		pr_err("xmm7360: reprobe after S3 failed\n");
-}
-static DECLARE_WORK(xmm7360_reprobe_work, xmm7360_reprobe_fn);
-
-
+static int __maybe_unused xmm7360_resume(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct xmm_dev *xmm = pci_get_drvdata(pdev);
@@ -2412,19 +2412,22 @@ static DECLARE_WORK(xmm7360_reprobe_work, xmm7360_reprobe_fn);
 	}
 
 	/*
-	 * Modem did not survive the sleep (D3cold across S3 on this platform --
-	 * happens on every S3 here).  In-place rebuild is unsafe, so schedule a
-	 * full unbind + fresh probe, identical to the known-good S4 path.  The
-	 * reprobe work is file-scope (not embedded in xmm) because the unbind it
-	 * performs frees xmm.  Leave the netdev detached / queue stopped; the
-	 * fresh probe recreates everything.
+	 * Modem did not survive the sleep.  Leave the netdev detached and the
+	 * queue stopped (recovery_work recreates them) and schedule a full
+	 * rebuild.  Reset the recovery throttle: a resume is a legitimate fresh
+	 * event, not a runaway recovery loop, so always allow the rebuild.
+	 * dev_init() now guards its first MMIO access on the PCIe link being up,
+	 * so if the slot is still D3cold the rebuild fails cleanly (-ENODEV)
+	 * instead of hanging the CPU on a read to a dead device.
 	 */
 	dev_warn(dev,
-		 "xmm7360: modem did not survive S3 (link/status down) -- scheduling reprobe\n");
+		 "xmm7360: modem did not survive S3 (link/status down) -- scheduling rebuild\n");
 	xmm7360_set_error(xmm, -ENODEV);
-	schedule_work(&xmm7360_reprobe_work);
+	xmm->recovery_count = 0;
+	xmm->last_recovery_jiffies = jiffies - 5 * 60 * HZ;
+	schedule_work(&xmm->recovery_work);
 
-	dev_info(dev, "xmm7360: resumed (S3), reprobe scheduled\n");
+	dev_info(dev, "xmm7360: resumed (S3), recovery scheduled\n");
 	return 0;
 }
 
@@ -2462,6 +2465,7 @@ static struct pci_driver xmm7360_driver = {
  * driver, which re-probes the device cleanly -- exactly like a cold boot
  * (which we know works).
  */
+static bool xmm7360_pci_registered;
 
 static int xmm7360_pm_notify(struct notifier_block *nb, unsigned long mode,
 			     void *unused)
@@ -2559,12 +2563,6 @@ static int xmm7360_init(void)
 static void xmm7360_exit(void)
 {
 	unregister_pm_notifier(&xmm7360_pm_notifier);
-	/*
-	 * Flush any in-flight/pending S3 reprobe before we tear the driver
-	 * down, otherwise it could call pci_register_driver() after we've
-	 * unregistered, or run against a half-freed state.
-	 */
-	cancel_work_sync(&xmm7360_reprobe_work);
 	if (xmm7360_pci_registered) {
 		pci_unregister_driver(&xmm7360_driver);
 		xmm7360_pci_registered = false;
