@@ -1,7 +1,9 @@
 name: rpc-tool
 
-# Build the userspace open_xdatachannel tool and run the unit test suite
-# in a real Arch container. Plain `gcc` (no version pin). No hardware needed.
+# Build the userspace open_xdatachannel tool and run the unit-test suite.
+# No hardware required. Primary job runs on stable Ubuntu (deterministic,
+# cached). A separate, non-blocking Arch job keeps rolling-distro coverage
+# without letting pacman mirror flakiness fail the whole pipeline.
 
 on:
   push:
@@ -15,81 +17,119 @@ on:
       - 'tests/**'
   workflow_dispatch:
 
-jobs:
-  build-and-test:
-    name: build tool + run tests
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
+# Cancel superseded runs on the same ref so the badge reflects the latest push.
+concurrency:
+  group: rpc-tool-${{ github.ref }}
+  cancel-in-progress: true
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # -- Primary, must-pass job: stable Ubuntu --------------------------------
+  build-and-test:
+    name: build + test (ubuntu)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed \
-            base-devel pkgconf openssl util-linux valgrind
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev uuid-dev valgrind cppcheck
 
-      - name: Build tool (gcc)
+      - name: Build tool
         working-directory: tool
         run: |
+          set -euxo pipefail
           make clean
           make
-          test -x open_xdatachannel || { echo "::error::tool not built"; exit 1; }
+          test -x open_xdatachannel || { echo "::error::tool binary not built"; exit 1; }
 
-      - name: Build tool (strict warnings)
+      - name: Build tool (strict -Werror)
         working-directory: tool
         run: |
+          set -euxo pipefail
           make clean
           make CFLAGS="-std=c11 -Wall -Wextra -Werror -O2"
 
       - name: Run unit tests
         working-directory: tests
         run: |
+          set -euxo pipefail
+          # Capture output AND preserve make's real exit status (pipefail).
           make test 2>&1 | tee test-output.log
 
       - name: Memory check (valgrind)
         working-directory: tests
         run: |
-          make clean && make test_proto test_rpc
-          valgrind --error-exitcode=1 --leak-check=full \
-                   --errors-for-leak-kinds=definite ./test_proto
-          valgrind --error-exitcode=1 --leak-check=full \
-                   --errors-for-leak-kinds=definite ./test_rpc
+          set -euxo pipefail
+          make clean
+          make test_proto test_rpc
+          for t in test_proto test_rpc; do
+            echo "::group::valgrind $t"
+            valgrind --error-exitcode=1 \
+                     --leak-check=full \
+                     --errors-for-leak-kinds=definite \
+                     --show-leak-kinds=definite \
+                     "./$t"
+            echo "::endgroup::"
+          done
 
-      - name: Upload test logs
+      - name: Static analysis (cppcheck, advisory)
+        working-directory: tool
+        run: |
+          set -uxo pipefail
+          # Advisory only: never fails the build.
+          cppcheck --enable=warning,portability,performance \
+                   --inline-suppr \
+                   --suppress=missingIncludeSystem \
+                   . 2>&1 | tee ../cppcheck.log || true
+
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: rpc-test-logs
-          path: tests/test-output.log
+          path: |
+            tests/test-output.log
+            cppcheck.log
           retention-days: 14
+          if-no-files-found: ignore
 
-  static-analysis:
-    name: cppcheck
+  # -- Non-blocking job: rolling Arch coverage -----------------------------
+  # Kept separate and continue-on-error so pacman mirror/keyring desync (the
+  # usual cause of "it fails every time") cannot red-X the whole workflow.
+  build-and-test-arch:
+    name: build + test (arch, non-blocking)
     runs-on: ubuntu-latest
+    continue-on-error: true
     container:
       image: archlinux:base-devel
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install cppcheck
-        run: pacman -Syu --noconfirm --needed cppcheck
-
-      - name: Run cppcheck on tool/
+      - name: Refresh keyring + install deps
         run: |
-          # Advisory only — warnings do not fail the build.
-          cppcheck --enable=warning,portability,performance \
-                   --inline-suppr \
-                   --suppress=missingIncludeSystem \
-                   tool/ 2>&1 | tee cppcheck.log || true
+          set -euxo pipefail
+          # Update the keyring FIRST and on its own; stale keyrings in the
+          # base-devel image are the #1 cause of pacman -Syu failures in CI.
+          pacman -Sy --noconfirm --needed archlinux-keyring
+          pacman -Su --noconfirm
+          pacman -S  --noconfirm --needed \
+            base-devel pkgconf openssl util-linux valgrind
 
-      - name: Upload cppcheck log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cppcheck-log
-          path: cppcheck.log
-          retention-days: 14
+      - name: Build + strict build + tests
+        run: |
+          set -euxo pipefail
+          make -C tool clean && make -C tool
+          make -C tool clean && make -C tool CFLAGS="-std=c11 -Wall -Wextra -Werror -O2"
+          make -C tests test

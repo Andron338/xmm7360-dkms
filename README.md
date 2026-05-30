@@ -10,7 +10,11 @@ See [DEVICES.md](DEVICES.md) for the full list of tested devices.
 > ⚠️ _In development. No support provided. May not work, may crash your
 > computer, may singe your jaffles._
 
-![CI](https://github.com/Andron338/xmm7360-dkms/actions/workflows/tests.yaml/badge.svg)
+[![Tests](https://github.com/Andron338/xmm7360-dkms/actions/workflows/tests.yaml/badge.svg)](https://github.com/Andron338/xmm7360-dkms/actions/workflows/tests.yaml)
+[![Kernel Module CI](https://github.com/Andron338/xmm7360-dkms/actions/workflows/kernel-module-ci.yaml/badge.svg)](https://github.com/Andron338/xmm7360-dkms/actions/workflows/kernel-module-ci.yaml)
+[![Arch PKGBUILD CI](https://github.com/Andron338/xmm7360-dkms/actions/workflows/makepkg.yaml/badge.svg)](https://github.com/Andron338/xmm7360-dkms/actions/workflows/makepkg.yaml)
+[![rpc-tool](https://github.com/Andron338/xmm7360-dkms/actions/workflows/rpc-tool.yml/badge.svg)](https://github.com/Andron338/xmm7360-dkms/actions/workflows/rpc-tool.yml)
+[![Publish to AUR](https://github.com/Andron338/xmm7360-dkms/actions/workflows/aur-publish.yaml/badge.svg)](https://github.com/Andron338/xmm7360-dkms/actions/workflows/aur-publish.yaml)
 
 ---
 

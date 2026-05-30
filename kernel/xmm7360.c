@@ -1805,6 +1805,8 @@ static int xmm7360_create_cdev(struct xmm_dev *xmm, int num, const char *name,
 	return 0;
 }
 
+static bool __maybe_unused xmm7360_pcie_link_active(struct xmm_dev *xmm);
+
 static int xmm7360_dev_init(struct xmm_dev *xmm)
 {
 	int ret, i;
@@ -1813,19 +1815,52 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 	WRITE_ONCE(xmm->error, 0);
 	xmm->num_ttys = 0;
 
-	status = xmm->bar2[0];
-	if (status == 0xfeedb007) {
-		dev_info(xmm->dev, "modem still booting, waiting...");
-		for (i = 0; i < 100; i++) {
-			status = xmm->bar2[0];
-			if (status != 0xfeedb007)
-				break;
-			msleep(200);
+	/*
+	 * dev_init runs on three paths: initial probe, do_rebuild() (from
+	 * recovery_work after a dead-modem resume), and the S4 reprobe.  On the
+	 * recovery/reprobe paths the M.2 slot may still be in D3cold or the PCIe
+	 * link may not have retrained yet.  resume() already guards its own
+	 * status read with xmm7360_pcie_link_active(); dev_init did not, so a
+	 * rebuild on a not-yet-ready slot read bar2[0] cold.  A BAR read to a
+	 * non-responding endpoint does NOT fault -- it stalls the CPU until the
+	 * bus times out (and on some chipsets never returns), i.e. the hard S3
+	 * wedge.  Mirror resume()'s guard here: put the device in D0 and confirm
+	 * the upstream link is up (config-space read, cannot hang like a BAR
+	 * read) before touching bar2.  If the link is down, fail cleanly so
+	 * recovery_work can retry later instead of wedging.
+	 */
+	if (xmm->pci_dev) {
+		pci_set_power_state(xmm->pci_dev, PCI_D0);
+		if (xmm->pci_dev->bus && xmm->pci_dev->bus->self &&
+		    !xmm7360_pcie_link_active(xmm)) {
+			dev_warn(xmm->dev,
+				 "PCIe link down at dev_init -- modem not reachable, aborting\n");
+			return -ENODEV;
 		}
 	}
 
+	/*
+	 * Wait for the modem to finish booting from its on-module NAND.  The
+	 * firmware is flash-resident (the host never reloads it), so after a
+	 * cold start or a power-cut resume the bootrom re-reads it from NAND,
+	 * which takes time.  During that window the status word reads neither
+	 * the booting sentinel nor the ready value (it may read 0, all-ones, or
+	 * stale data).  The old code sampled once and only waited if that single
+	 * read was exactly 0xfeedb007, so any other transient fell straight
+	 * through to "unknown status".  Poll for the ready value across the
+	 * whole ~20s boot budget and treat everything else as "keep waiting".
+	 */
+	status = xmm->bar2[BAR2_STATUS];
+	for (i = 0; i < 100 && status != 0x600df00d; i++) {
+		if (i == 0)
+			dev_info(xmm->dev, "waiting for modem to boot...\n");
+		msleep(200);
+		status = xmm->bar2[BAR2_STATUS];
+	}
+
 	if (status != 0x600df00d) {
-		dev_err(xmm->dev, "unknown modem status: 0x%08x\n", status);
+		dev_err(xmm->dev,
+			"modem not ready after boot wait: 0x%08x\n", status);
 		return -EINVAL;
 	}
 
@@ -1965,7 +2000,35 @@ rearm:
  */
 static int xmm7360_do_rebuild(struct xmm_dev *xmm)
 {
-	int ret;
+	int ret, i;
+
+	/*
+	 * Wait (bounded) for the PCIe link to come back before tearing anything
+	 * down.  On a D3cold S3 resume the slot may take a few seconds to
+	 * repower and retrain; if we rebuild immediately, dev_init's link guard
+	 * trips -ENODEV and the whole recovery attempt is wasted (and, before
+	 * the guard existed, a cold BAR read here wedged the CPU).
+	 *
+	 * This mirrors the vendor's own flow: the Windows flash/recovery service
+	 * issues a baseband reset ("BB_RST") and then RETRIES with a ~5s backoff
+	 * ("Call BB_RST FAIL. Retry after 5s."), explicitly waiting for the
+	 * modem to disappear and re-arrive rather than giving up on the first
+	 * miss.  We do the kernel-side analog: poll the upstream link-active bit
+	 * for up to ~6s (config-space read, cannot hang like a BAR read) and
+	 * only proceed once the slot is actually back.  If it never comes back,
+	 * fall through and let dev_init fail cleanly as before.
+	 */
+	if (xmm->pci_dev && xmm->pci_dev->bus && xmm->pci_dev->bus->self) {
+		for (i = 0; i < 30 && !xmm7360_pcie_link_active(xmm); i++) {
+			if (i == 0)
+				dev_info(xmm->dev,
+					 "recovery: waiting for PCIe link to return...\n");
+			msleep(200);
+		}
+		if (!xmm7360_pcie_link_active(xmm))
+			dev_warn(xmm->dev,
+				 "recovery: link still down after wait; attempting rebuild anyway\n");
+	}
 
 	/* Silence the IRQ source so the handler cannot race with dev_deinit
 	 * freeing cp/td_ring/qp/netdev. disable_irq() waits for any in-flight
