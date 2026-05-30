@@ -1507,22 +1507,6 @@ static void xmm7360_dev_deinit(struct xmm_dev *xmm)
 		qp->registered = false;
 		WRITE_ONCE(qp->open, 0);
 	}
-
-	/*
-	 * Destroy any TD rings still allocated.  These are normally torn down
-	 * by xmm7360_qp_stop() on userspace close(), but on a dead-modem resume
-	 * dev_deinit() runs while fds may still be open (or the close path was
-	 * skipped because xmm->error was set), leaving rings with depth != 0 and
-	 * live pages/pages_phys/tds pointers.  If we do not free them here, the
-	 * subsequent dev_init()->td_ring_create() either trips BUG_ON(ring->depth)
-	 * or races a late qp_stop() into a double-free (free_large_kmalloc oops).
-	 * td_ring_destroy() now nulls + zeroes depth, so this is idempotent.
-	 */
-	for (i = 0; i < 16; i++) {
-		if (xmm->td_ring[i].depth)
-			xmm7360_td_ring_destroy(xmm, i);
-	}
-
 	xmm7360_cmd_ring_free(xmm);
 }
 
