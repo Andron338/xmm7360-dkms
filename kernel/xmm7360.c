@@ -1847,15 +1847,13 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 	 * Before the FIRST MMIO access, make sure the device is actually
 	 * reachable.  On resume/rebuild the M.2 slot may still be in D3cold or
 	 * the PCIe link may not have retrained.  A BAR read to a non-responding
-	 * endpoint does NOT fault -- it stalls the CPU until the bus times out
-	 * (and on some chipsets never returns), which is the hard wedge seen on
-	 * S3 resume.  A BAR read to a non-responding
-	 * endpoint does NOT fault -- it stalls the CPU until the bus times out
-	 * (and on some chipsets never returns), which is the hard wedge seen on
-	 * S3 resume.  Put the device back in D0, then consult the upstream port's
-	 * link-active bit via config space (handled by the root complex, so it
-	 * cannot hang like a BAR read).  If the link is down, bail cleanly
-	 * instead of touching bar2[0].
+	 * Before the first MMIO access, make sure the device is reachable.  A BAR
+	 * read to a non-responding endpoint does NOT fault -- it stalls the CPU
+	 * until the bus times out (and on some chipsets never returns), which is
+	 * the hard wedge seen on S3 resume.  Put the device back in D0, then
+	 * consult the upstream port's link-active bit via config space (handled by
+	 * the root complex, so it cannot hang like a BAR read).  If the link is
+	 * down, bail cleanly instead of touching bar2[0].
 	 */
 	if (xmm->pci_dev) {
 		pci_set_power_state(xmm->pci_dev, PCI_D0);
@@ -1867,19 +1865,36 @@ static int xmm7360_dev_init(struct xmm_dev *xmm)
 		}
 	}
 
+	/*
+	 * Wait for the modem to finish booting itself.
+	 *
+	 * The XMM7360 firmware is resident in NAND flash on the M.2 module
+	 * (the host never reloads it -- the vendor's flash utility only writes
+	 * NAND during a firmware *update*).  On a cold start or an S3 resume
+	 * where the slot was powered down, the modem's bootrom re-reads and
+	 * re-initialises that firmware from NAND, which takes time.  During that
+	 * window the status register reads neither the "booting" sentinel nor
+	 * the "ready" value -- it may read 0, all-ones, or stale garbage while
+	 * the firmware is still coming up.
+	 *
+	 * The old code sampled bar2[0] once and only waited if that single read
+	 * happened to be exactly 0xfeedb007; any other transient value fell
+	 * straight through to the "unknown status" error.  Instead, poll for the
+	 * ready value across the whole boot window and treat booting/transient
+	 * values as "keep waiting".  ~20s budget (100 * 200ms) covers a cold
+	 * NAND boot with margin.
+	 */
 	status = xmm->bar2[0];
-	if (status == 0xfeedb007) {
-		dev_info(xmm->dev, "modem still booting, waiting...");
-		for (i = 0; i < 100; i++) {
-			status = xmm->bar2[0];
-			if (status != 0xfeedb007)
-				break;
-			msleep(200);
-		}
+	for (i = 0; i < 100 && status != 0x600df00d; i++) {
+		if (i == 0)
+			dev_info(xmm->dev, "waiting for modem to boot...\n");
+		msleep(200);
+		status = xmm->bar2[0];
 	}
 
 	if (status != 0x600df00d) {
-		dev_err(xmm->dev, "unknown modem status: 0x%08x\n", status);
+		dev_err(xmm->dev,
+			"modem not ready after boot wait: 0x%08x\n", status);
 		return -EINVAL;
 	}
 
